@@ -6,9 +6,10 @@ Enhanced to handle multi-period API responses efficiently.
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from calendar import monthrange
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,73 @@ class XeroNormalizedExporter:
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+
+    def _map_period_to_date_info(self, period_identifier: str, response_period: str) -> Dict[str, Any]:
+        """
+        Map Xero's counter-intuitive period numbering to meaningful date information.
+        
+        Xero's period system works backwards from the target date:
+        - period_1 = Most recent month (e.g., December if target is Dec 31)
+        - period_2 = Previous month (November)
+        - period_12 = 11 months back (January)
+        
+        Args:
+            period_identifier: Xero period (e.g., "period_1", "period_12")
+            response_period: Date range string (e.g., "2024-01-01_to_2024-12-31")
+            
+        Returns:
+            Dict with month_name, month_number, year, date_as_of
+        """
+        try:
+            # Extract period number
+            period_num = int(period_identifier.replace("period_", ""))
+            
+            # Extract end date from response period
+            if "_to_" in response_period:
+                end_date_str = response_period.split("_to_")[1]
+            else:
+                end_date_str = response_period
+                
+            end_date = datetime.fromisoformat(end_date_str).date()
+            
+            # Calculate the actual month this period represents
+            # period_1 = end_date month, period_2 = end_date - 1 month, etc.
+            months_back = period_num - 1
+            
+            # Calculate target year and month
+            target_year = end_date.year
+            target_month = end_date.month - months_back
+            
+            # Handle year rollover
+            while target_month <= 0:
+                target_month += 12
+                target_year -= 1
+                
+            # Get the last day of the target month for "as of" date
+            last_day = monthrange(target_year, target_month)[1]
+            date_as_of = date(target_year, target_month, last_day)
+            
+            # Month names
+            month_names = [
+                "", "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"
+            ]
+            
+            return {
+                "month_name": month_names[target_month],
+                "month_number": target_month,
+                "year": target_year,
+                "date_as_of": date_as_of.isoformat()
+            }
+            
+        except (ValueError, IndexError, AttributeError) as e:
+            logger.warning(f"Could not parse period info: {period_identifier}, {response_period} - {e}")
+            return {
+                "month_name": "Unknown",
+                "month_number": 0,
+                "year": 0,
+                "date_as_of": "Unknown"
+            }
 
     def _find_json_content_block(self, content_blocks: List[Dict]) -> Optional[List[Dict]]:
         """
@@ -211,7 +279,8 @@ class XeroNormalizedExporter:
         self, 
         row: Dict, 
         section_title: str, 
-        is_pl: bool = True
+        is_pl: bool = True,
+        response_period: str = ""
     ) -> List[Dict[str, Any]]:
         """
         Normalize a single row that may contain multiple periods of data.
@@ -275,6 +344,9 @@ class XeroNormalizedExporter:
                         period_identifier = attr.get("value", period_identifier)
                         break
             
+            # Get enhanced date information
+            date_info = self._map_period_to_date_info(period_identifier, response_period)
+            
             normalized_item = {
                 "section": section_title,
                 "account_name": account_name,
@@ -282,7 +354,11 @@ class XeroNormalizedExporter:
                 "amount": amount,
                 "row_type": row_type,
                 "is_summary": row_type == "SummaryRow",
-                "period_identifier": period_identifier
+                "period_identifier": period_identifier,
+                "month_name": date_info["month_name"],
+                "month_number": date_info["month_number"],
+                "year": date_info["year"],
+                "date_as_of": date_info["date_as_of"]
             }
             
             normalized_items.append(normalized_item)
@@ -293,7 +369,8 @@ class XeroNormalizedExporter:
     def _normalize_section_direct_with_periods(
         self, 
         section: Dict, 
-        is_pl: bool = True
+        is_pl: bool = True,
+        response_period: str = ""
     ) -> List[Dict[str, Any]]:
         """
         Handle sections that are direct data items (like GROSS PROFIT, NET PROFIT) with multiple periods.
@@ -357,6 +434,9 @@ class XeroNormalizedExporter:
                 ]
                 is_summary_item = row_type == "SummaryRow" or title in bs_summary_titles
             
+            # Get enhanced date information
+            date_info = self._map_period_to_date_info(period_identifier, response_period)
+            
             normalized_item = {
                 "section": "",  # Direct items typically have empty section
                 "account_name": title,
@@ -364,7 +444,11 @@ class XeroNormalizedExporter:
                 "amount": amount,
                 "row_type": row_type if row_type else "Row",
                 "is_summary": is_summary_item,
-                "period_identifier": period_identifier
+                "period_identifier": period_identifier,
+                "month_name": date_info["month_name"],
+                "month_number": date_info["month_number"],
+                "year": date_info["year"],
+                "date_as_of": date_info["date_as_of"]
             }
             
             normalized_items.append(normalized_item)
@@ -676,9 +760,12 @@ class XeroNormalizedExporter:
                 normalized_data = self.extract_and_normalize_pl_data(pl_response)
                 
                 if normalized_data:
-                    # Add response-level period information to each record
+                    # Add response-level period information and update date info for each record
                     for item in normalized_data:
                         item["response_period"] = date_range
+                        # Update date info with proper response period context
+                        date_info = self._map_period_to_date_info(item["period_identifier"], date_range)
+                        item.update(date_info)
                     
                     combined_data.extend(normalized_data)
                     
@@ -775,9 +862,12 @@ class XeroNormalizedExporter:
                 normalized_data = self.extract_and_normalize_bs_data(bs_response)
                 
                 if normalized_data:
-                    # Add response-level period information to each record
+                    # Add response-level period information and update date info for each record
                     for item in normalized_data:
                         item["response_period"] = as_at_date
+                        # Update date info with proper response period context
+                        date_info = self._map_period_to_date_info(item["period_identifier"], as_at_date)
+                        item.update(date_info)
                     
                     combined_data.extend(normalized_data)
                     
