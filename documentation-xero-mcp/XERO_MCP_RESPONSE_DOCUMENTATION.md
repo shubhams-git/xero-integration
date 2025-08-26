@@ -8,6 +8,28 @@ This document provides a comprehensive breakdown of the Xero MCP (Model Context 
 ### The Counter-Intuitive Period Mapping
 **CRITICAL**: Xero's period numbering is counter-intuitive and can lead to serious data interpretation errors.
 
+### How Xero P&L Periods Actually Work
+
+**The Key Insight**: Xero's P&L periods work BACKWARDS from your target month.
+
+**Example: Getting 12 months of 2024 data**
+1. **Target Month**: December 2024 (what you want + comparisons)
+2. **Date Range**: `fromDate: "2024-12-01"`, `toDate: "2024-12-31"`
+3. **Periods**: `11` (comparison months)
+4. **Result**: December 2024 + 11 previous months = 12 months total
+
+**What Xero Returns:**
+- `period_1` = December 2024 (your target month)
+- `period_2` = November 2024 (1 month back)
+- `period_3` = October 2024 (2 months back)
+- ...
+- `period_12` = January 2024 (11 months back)
+
+**Why This Works:**
+- You specify the EXACT month you want (December)
+- Xero gives you that month PLUS the requested comparison periods
+- Total periods = 1 (target) + 11 (comparisons) = 12 months
+
 ```
 Xero Period System (BACKWARDS from what you'd expect):
 - period_1  = December (most recent month)
@@ -119,7 +141,25 @@ The `content` array typically contains multiple blocks:
 
 ## API Call Patterns
 
-### Profit & Loss Requests
+### Profit & Loss Requests (CORRECTED LOGIC)
+**CRITICAL**: The correct way to get 12 months of P&L data:
+
+```json
+{
+  "fromDate": "2024-12-01",
+  "toDate": "2024-12-31", 
+  "periods": 11,
+  "timeframe": "MONTH",
+  "standardLayout": true
+}
+```
+
+**Key Points:**
+- `fromDate`/`toDate`: First and last day of TARGET MONTH (December in this example)
+- `periods`: 11 (gets target month + 11 previous months = 12 total)
+- Result: December 2024 + Nov, Oct, Sep... back to January 2024
+
+**Wrong Approach (Don't Do This):**
 ```json
 {
   "fromDate": "2024-01-01",
@@ -129,6 +169,7 @@ The `content` array typically contains multiple blocks:
   "standardLayout": true
 }
 ```
+This gives you January + 11 months forward, missing December!
 
 ### Balance Sheet Requests
 ```json

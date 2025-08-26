@@ -141,7 +141,7 @@ class XeroNormalizedExporter:
         logger.warning("No valid JSON data block found in any content block")
         return None
 
-    def extract_and_normalize_pl_data(self, pl_response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def extract_and_normalize_pl_data(self, pl_response: Dict[str, Any], response_period: str = "") -> List[Dict[str, Any]]:
         """
         Extract and normalize P&L data from Xero response to match your desired format.
         Enhanced to handle multi-period responses from efficient API calls.
@@ -149,6 +149,7 @@ class XeroNormalizedExporter:
         
         Args:
             pl_response: Raw P&L response from Xero MCP (may contain multiple periods)
+            response_period: Date range string for this response (e.g., "2024-01-01_to_2024-12-31")
             
         Returns:
             List of normalized financial line items matching your JSON structure
@@ -164,7 +165,7 @@ class XeroNormalizedExporter:
         
         if json_data:
             logger.debug(f"Found JSON data with {len(json_data)} sections")
-            block_normalized = self._normalize_pl_sections(json_data)
+            block_normalized = self._normalize_pl_sections(json_data, response_period)
             normalized_data.extend(block_normalized)
             logger.info(f"P&L extraction successful: {len(block_normalized)} items extracted")
         else:
@@ -173,7 +174,7 @@ class XeroNormalizedExporter:
         logger.info(f"P&L extraction complete: {len(normalized_data)} total items extracted")
         return normalized_data
 
-    def extract_and_normalize_bs_data(self, bs_response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def extract_and_normalize_bs_data(self, bs_response: Dict[str, Any], response_period: str = "") -> List[Dict[str, Any]]:
         """
         Extract and normalize Balance Sheet data from Xero response.
         Enhanced to handle multi-period responses from efficient API calls.
@@ -181,6 +182,7 @@ class XeroNormalizedExporter:
         
         Args:
             bs_response: Raw Balance Sheet response from Xero MCP (may contain multiple periods)
+            response_period: Date range string for this response (e.g., "2024-01-01_to_2024-12-31")
             
         Returns:
             List of normalized balance sheet line items
@@ -196,7 +198,7 @@ class XeroNormalizedExporter:
         
         if json_data:
             logger.debug(f"Found JSON data with {len(json_data)} sections")
-            block_normalized = self._normalize_bs_sections(json_data)
+            block_normalized = self._normalize_bs_sections(json_data, response_period)
             normalized_data.extend(block_normalized)
             logger.info(f"Balance Sheet extraction successful: {len(block_normalized)} items extracted")
         else:
@@ -205,13 +207,14 @@ class XeroNormalizedExporter:
         logger.info(f"Balance Sheet extraction complete: {len(normalized_data)} total items extracted")
         return normalized_data
 
-    def _normalize_pl_sections(self, sections: List[Dict]) -> List[Dict[str, Any]]:
+    def _normalize_pl_sections(self, sections: List[Dict], response_period: str = "") -> List[Dict[str, Any]]:
         """
         Normalize P&L sections into the exact format matching your JSON structure.
         Enhanced to handle multi-period data with proper period identification.
         
         Args:
             sections: List of P&L sections from Xero (may include multiple periods)
+            response_period: Date range string for this response (e.g., "2024-01-01_to_2024-12-31")
             
         Returns:
             List of normalized line items in your required format
@@ -227,26 +230,27 @@ class XeroNormalizedExporter:
             # Handle different section types
             if section_type == "Section" and "rows" in section:
                 for row in section["rows"]:
-                    items = self._normalize_row_with_periods(row, section_title, is_pl=True)
+                    items = self._normalize_row_with_periods(row, section_title, is_pl=True, response_period=response_period)
                     if items:
                         normalized_items.extend(items)
             
             # Handle section headers and summary rows that aren't in "rows"
             elif section_type in ["Header", "SummaryRow", "Row"]:
-                items = self._normalize_section_direct_with_periods(section, is_pl=True)
+                items = self._normalize_section_direct_with_periods(section, is_pl=True, response_period=response_period)
                 if items:
                     normalized_items.extend(items)
         
         logger.debug(f"Normalized {len(normalized_items)} P&L items from {len(sections)} sections")
         return normalized_items
 
-    def _normalize_bs_sections(self, sections: List[Dict]) -> List[Dict[str, Any]]:
+    def _normalize_bs_sections(self, sections: List[Dict], response_period: str = "") -> List[Dict[str, Any]]:
         """
         Normalize Balance Sheet sections into the required format.
         Enhanced to handle multi-period data with proper period identification.
         
         Args:
             sections: List of Balance Sheet sections from Xero (may include multiple periods)
+            response_period: Date range string for this response (e.g., "2024-01-01_to_2024-12-31")
             
         Returns:
             List of normalized line items for Balance Sheet
@@ -262,13 +266,13 @@ class XeroNormalizedExporter:
             # Handle different section types
             if section_type == "Section" and "rows" in section:
                 for row in section["rows"]:
-                    items = self._normalize_row_with_periods(row, section_title, is_pl=False)
+                    items = self._normalize_row_with_periods(row, section_title, is_pl=False, response_period=response_period)
                     if items:
                         normalized_items.extend(items)
             
             # Handle section headers and summary rows that aren't in "rows"
             elif section_type in ["Header", "SummaryRow", "Row"]:
-                items = self._normalize_section_direct_with_periods(section, is_pl=False)
+                items = self._normalize_section_direct_with_periods(section, is_pl=False, response_period=response_period)
                 if items:
                     normalized_items.extend(items)
         
@@ -650,7 +654,7 @@ class XeroNormalizedExporter:
         Returns:
             Path to saved JSON file
         """
-        normalized_data = self.extract_and_normalize_pl_data(pl_response)
+        normalized_data = self.extract_and_normalize_pl_data(pl_response, date_range)
         
         if not normalized_data:
             raise ValueError("No P&L data found in response")
@@ -698,7 +702,7 @@ class XeroNormalizedExporter:
         Returns:
             Path to saved JSON file
         """
-        normalized_data = self.extract_and_normalize_bs_data(bs_response)
+        normalized_data = self.extract_and_normalize_bs_data(bs_response, as_at_date)
         
         if not normalized_data:
             raise ValueError("No Balance Sheet data found in response")
@@ -757,15 +761,13 @@ class XeroNormalizedExporter:
         for pl_response, date_range in pl_responses:
             try:
                 # Extract normalized data for this response (may contain multiple periods)
-                normalized_data = self.extract_and_normalize_pl_data(pl_response)
+                # Pass the response_period to avoid warnings during initial processing
+                normalized_data = self.extract_and_normalize_pl_data(pl_response, date_range)
                 
                 if normalized_data:
-                    # Add response-level period information and update date info for each record
+                    # Add response-level period information (already processed during extraction)
                     for item in normalized_data:
                         item["response_period"] = date_range
-                        # Update date info with proper response period context
-                        date_info = self._map_period_to_date_info(item["period_identifier"], date_range)
-                        item.update(date_info)
                     
                     combined_data.extend(normalized_data)
                     
@@ -859,15 +861,13 @@ class XeroNormalizedExporter:
         for bs_response, as_at_date in bs_responses:
             try:
                 # Extract normalized data for this response (may contain multiple periods)
-                normalized_data = self.extract_and_normalize_bs_data(bs_response)
+                # Pass the response_period to avoid warnings during initial processing
+                normalized_data = self.extract_and_normalize_bs_data(bs_response, as_at_date)
                 
                 if normalized_data:
-                    # Add response-level period information and update date info for each record
+                    # Add response-level period information (already processed during extraction)
                     for item in normalized_data:
                         item["response_period"] = as_at_date
-                        # Update date info with proper response period context
-                        date_info = self._map_period_to_date_info(item["period_identifier"], as_at_date)
-                        item.update(date_info)
                     
                     combined_data.extend(normalized_data)
                     

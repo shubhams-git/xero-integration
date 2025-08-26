@@ -31,6 +31,7 @@ from utils.xero_tools import (
     get_last_complete_month, 
     get_profit_and_loss_periods,
     get_balance_sheet_periods,
+    get_month_with_comparisons,
     print_formatted_response,
     DateRange
 )
@@ -123,20 +124,18 @@ def export_smart_pl_data(client, export_dir: str = "exports") -> bool:
         try:
             logger.info(f"📊 Fetching P&L data for year: {year}")
             
-            # Xero's quirky way: Use December 31st as the target date
-            # This will give us Dec + previous 11 months = full year
-            year_end = date(year, 12, 31)  # Use year-end as target
-            # Create a date range that starts from the year beginning for reference
-            year_start = date(year, 1, 1)
-            date_range = DateRange(year_start, year_end)
+            # Correct Xero P&L logic: Use December as target month
+            # This will give us Dec + previous 11 months = full year (12 months total)
+            december_date = date(year, 12, 15)  # Any date in December works
             
-            logger.debug(f"Year {year}: Target date = {year_end}, periods = 12")
+            logger.debug(f"Year {year}: Target month = December {year}, periods = 11 (gets 12 months total)")
             
-            # Make API call for 11 periods (months) of this year
+            # Make API call for 11 comparison periods (months) of this year
             # Xero API limitation: periods must be 1-11, not 12
+            # This gets December + Nov, Oct, Sep... back to January = 12 months
             pl_response = get_profit_and_loss_periods(
                 client, 
-                date_range, 
+                december_date, 
                 periods=11,
                 timeframe="MONTH"
             )
@@ -144,6 +143,8 @@ def export_smart_pl_data(client, export_dir: str = "exports") -> bool:
             
             if pl_response.success:
                 # Store the response with year identifier
+                year_start = date(year, 1, 1)
+                year_end = date(year, 12, 31)
                 date_range_str = f"{year_start.isoformat()}_to_{year_end.isoformat()}"
                 all_pl_data.append((pl_response.data, date_range_str, year))
                 success_count += 1

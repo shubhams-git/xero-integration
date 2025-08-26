@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 utils/xero_tools.py
 
@@ -132,6 +131,27 @@ def get_last_complete_month(reference_date: Optional[date] = None) -> DateRange:
     first_previous = date(last_previous.year, last_previous.month, 1)
     
     return DateRange(first_previous, last_previous)
+
+
+def get_month_with_comparisons(target_year: int, target_month: int, comparison_periods: int = 11) -> tuple[date, int]:
+    """
+    Get the target date and periods for P&L retrieval with monthly comparisons.
+    
+    Args:
+        target_year: Year of the target month
+        target_month: Month number (1-12) of the target month
+        comparison_periods: Number of comparison periods (default 11 for 12 months total)
+        
+    Returns:
+        tuple[date, int]: (target_month_date, periods) for use with get_profit_and_loss_periods
+        
+    Example:
+        # Get December 2024 + 11 previous months (full year)
+        target_date, periods = get_month_with_comparisons(2024, 12, 11)
+        pl_response = get_profit_and_loss_periods(client, target_date, periods)
+    """
+    target_date = date(target_year, target_month, 15)  # Mid-month date
+    return target_date, comparison_periods
 
 
 def get_current_month(reference_date: Optional[date] = None) -> DateRange:
@@ -421,19 +441,26 @@ def get_profit_and_loss(
 
 def get_profit_and_loss_periods(
     client: MCPClient,
-    date_range: DateRange,
-    periods: int = 12,
+    target_month_date: date,
+    periods: int = 11,
     timeframe: str = "MONTH",
     standard_layout: bool = True
 ) -> XeroToolResponse:
     """
-    Get Profit & Loss report for specified date range with multiple periods.
-    This is the efficient version that gets up to 11 months in a single API call.
+    Get Profit & Loss report for a target month with multiple comparison periods.
+    
+    IMPORTANT: Xero P&L periods logic requires:
+    - fromDate: First day of target month (e.g., 2024-12-01)
+    - toDate: Last day of target month (e.g., 2024-12-31)  
+    - periods: 11 (gets target month + 11 previous months = 12 total)
+    - timeframe: "MONTH"
+    
+    This gives you the target month plus 11 months of comparison data.
     
     Args:
         client: MCP client instance
-        date_range: Date range for the report (typically a full year)
-        periods: Number of periods to retrieve (max 11, typically months)
+        target_month_date: Any date in the target month (e.g., 2024-12-15 for December 2024)
+        periods: Number of comparison periods (11 gets you 12 months total)
         timeframe: Time frame for periods ("MONTH", "QUARTER", "YEAR")
         standard_layout: Whether to use standard layout
         
@@ -443,12 +470,25 @@ def get_profit_and_loss_periods(
     start_time = datetime.now()
     
     try:
-        logger.debug(f"📊 Fetching P&L report with {periods} {timeframe.lower()}s for {date_range}")
+        # Calculate first and last day of the target month
+        first_day = date(target_month_date.year, target_month_date.month, 1)
         
-        arguments = date_range.to_iso_dict()
-        arguments["periods"] = periods
-        arguments["timeframe"] = timeframe
-        arguments["standardLayout"] = standard_layout
+        # Calculate last day of the month
+        if target_month_date.month == 12:
+            last_day = date(target_month_date.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last_day = date(target_month_date.year, target_month_date.month + 1, 1) - timedelta(days=1)
+        
+        logger.debug(f"📊 Fetching P&L report for {target_month_date.strftime('%B %Y')} with {periods} comparison periods")
+        logger.debug(f"📅 Date range: {first_day} to {last_day} (full target month)")
+        
+        arguments = {
+            "fromDate": first_day.isoformat(),
+            "toDate": last_day.isoformat(),
+            "periods": periods,
+            "timeframe": timeframe,
+            "standardLayout": standard_layout
+        }
         
         logger.debug(f"P&L API arguments: {arguments}")
         
@@ -456,6 +496,7 @@ def get_profit_and_loss_periods(
         execution_time = (datetime.now() - start_time).total_seconds()
         
         logger.debug(f"✅ P&L periods call completed in {execution_time:.2f}s")
+        logger.info(f"📊 Retrieved P&L data for {target_month_date.strftime('%B %Y')} + {periods} comparison months")
         
         return XeroToolResponse(
             success=True,
@@ -556,7 +597,7 @@ def get_balance_sheet(
 def get_balance_sheet_periods(
     client: MCPClient,
     date_range: DateRange,
-    periods: int = 12,
+    periods: int = 11,
     timeframe: str = "MONTH",
     standard_layout: bool = True
 ) -> XeroToolResponse:
@@ -770,7 +811,7 @@ def get_invoices(
 def get_efficient_yearly_pl_data(client: MCPClient, years: List[int]) -> List[XeroToolResponse]:
     """
     Get P&L data for multiple years using efficient API calls.
-    Each year is fetched with 12 periods in a single API call.
+    Each year is fetched with 12 periods in a single API call using the correct Xero logic.
     
     Args:
         client: MCP client instance
@@ -782,15 +823,15 @@ def get_efficient_yearly_pl_data(client: MCPClient, years: List[int]) -> List[Xe
     results = []
     
     for year in years:
-        logger.info(f"📊 Fetching P&L data for {year} (12 periods)")
+        logger.info(f"📊 Fetching P&L data for {year} (12 periods using December target)")
         
-        # Create date range for the full year
-        year_start = date(year, 1, 1)
-        year_end = date(year, 12, 31)
-        date_range = DateRange(year_start, year_end)
+        # Use December of the target year as the target month
+        # This will get December + 11 previous months = full year
+        december_date = date(year, 12, 15)  # Any date in December works
         
-        # Fetch 11 periods (months) in one API call (Xero API limit)
-        pl_response = get_profit_and_loss_periods(client, date_range, periods=11)
+        # Fetch 11 comparison periods (months) in one API call (Xero API limit)
+        # This gets December + Nov, Oct, Sep... back to January = 12 months total
+        pl_response = get_profit_and_loss_periods(client, december_date, periods=11)
         results.append(pl_response)
         
         # If we hit an auth error, stop trying
@@ -799,7 +840,7 @@ def get_efficient_yearly_pl_data(client: MCPClient, years: List[int]) -> List[Xe
             break
             
         if pl_response.success:
-            logger.info(f"✅ {year}: Successfully fetched 11 months of P&L data")
+            logger.info(f"✅ {year}: Successfully fetched 12 months of P&L data (Dec + 11 previous)")
         else:
             logger.warning(f"⚠️ {year}: Failed to fetch P&L data - {pl_response.error_message}")
     
