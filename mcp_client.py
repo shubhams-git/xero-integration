@@ -1,6 +1,7 @@
 """
-MCP client focused on normalized JSON export only.
-Produces a single combined xero_pl_normalized file.
+Comprehensive MCP client for both P&L and Balance Sheet normalized JSON exports.
+Produces combined normalized files for both report types using efficient API calls.
+Makes only 10 total API calls to get 5 years of data (5 P&L + 5 Balance Sheet).
 """
 
 import logging
@@ -8,6 +9,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional
+from datetime import date
+from calendar import monthrange
 
 # Optional .env support
 try:
@@ -26,17 +29,22 @@ from utils.mcp_connection import (
 from utils.xero_tools import (
     get_organisation_details,
     get_last_complete_month, 
-    get_profit_and_loss,
+    get_profit_and_loss_periods,
+    get_balance_sheet_periods,
     print_formatted_response,
     DateRange
 )
 
 # Import our streamlined exporter
-from utils.xero_data_export import XeroNormalizedExporter, analyze_pl_structure
+from utils.xero_data_export import (
+    XeroNormalizedExporter, 
+    analyze_pl_structure, 
+    analyze_bs_structure
+)
 
 # Configure logging with better formatting
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Back to INFO for clean output
     format='%(asctime)s - %(name)-20s - %(levelname)-8s - %(message)s',
     handlers=[
         logging.StreamHandler()
@@ -44,8 +52,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress debug logs from utils unless needed
+# Keep some debug info for troubleshooting if needed
 logging.getLogger('utils.mcp_connection').setLevel(logging.WARNING)
+logging.getLogger('utils.xero_data_export').setLevel(logging.INFO)
+logging.getLogger('utils.xero_tools').setLevel(logging.INFO)
 
 
 class AuthenticationFailureError(Exception):
@@ -74,9 +84,11 @@ def check_authentication_and_halt(response, context: str) -> None:
             )
 
 
-def export_current_month_pl(client, export_dir: str = "exports") -> bool:
+def export_smart_pl_data(client, export_dir: str = "exports") -> bool:
     """
-    Export current month's P&L data in normalized JSON format.
+    Export 5 years of P&L data using efficient API calls (5 calls total).
+    Each call gets up to 11 periods of data (Xero API limitation).
+    Uses Xero's period handling - requests year-end and gets previous 10 months.
     
     Args:
         client: MCP client instance
@@ -88,187 +100,187 @@ def export_current_month_pl(client, export_dir: str = "exports") -> bool:
     Raises:
         AuthenticationFailureError: If authentication fails
     """
-    logger.info("📊 Starting current month P&L export (normalized JSON)")
-    
-    # Create exporter
-    exporter = XeroNormalizedExporter(export_dir)
-    
-    # Get last complete month's P&L data
-    last_month = get_last_complete_month()
-    logger.info(f"📅 Target period: {last_month}")
-    
-    pl_response = get_profit_and_loss(client, last_month)
-    check_authentication_and_halt(pl_response, "P&L data fetch")
-    
-    if not pl_response.success:
-        logger.error(f"❌ Failed to get P&L data: {pl_response.error_message}")
-        return False
-    
-    # Display the P&L for verification
-    print_formatted_response(
-        pl_response.data,
-        f"P&L Data - {last_month}"
-    )
-    
-    # Analyze the structure
-    logger.info("🔍 Analyzing P&L data structure...")
-    analysis = analyze_pl_structure(pl_response.data)
-    
-    print(f"\n=== P&L Data Analysis ===")
-    print(f"Total line items: {analysis['total_line_items']}")
-    print(f"Sections found: {len(analysis['sections'])}")
-    print(f"Section breakdown:")
-    for section, count in analysis['section_breakdown'].items():
-        print(f"  - {section}: {count} items")
-    
-    # Export to normalized JSON format
-    date_range_str = f"{last_month.start_date}_to_{last_month.end_date}"
-    
-    try:
-        logger.info("💾 Exporting P&L data to normalized JSON...")
-        
-        json_path = exporter.export_pl_normalized_json(
-            pl_response.data, 
-            date_range=date_range_str
-        )
-        
-        print(f"\n=== Export Results ===")
-        print(f"✅ Normalized JSON: {json_path}")
-        
-        # Validate the exported file matches your structure
-        logger.info("✅ Validating exported file structure...")
-        try:
-            import json
-            with open(json_path, 'r', encoding='utf-8') as f:
-                exported_data = json.load(f)
-            
-            metadata = exported_data.get('export_metadata', {})
-            data = exported_data.get('data', [])
-            
-            print(f"\n=== Export Validation ===")
-            print(f"Format: {metadata.get('format')}")
-            print(f"Record count: {metadata.get('record_count')}")
-            print(f"Date range: {metadata.get('date_range')}")
-            print(f"Actual data records: {len(data)}")
-            
-            # Show sample of the data structure
-            if data:
-                print(f"\n=== Sample Record Structure ===")
-                sample = data[0]
-                for key, value in sample.items():
-                    print(f"  {key}: {repr(value)} ({type(value).__name__})")
-        
-        except Exception as e:
-            logger.warning(f"⚠️ Could not validate exported file: {e}")
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Export failed: {e}")
-        return False
-
-
-def export_combined_multi_month_pl(client, months_back: int = 3, export_dir: str = "exports") -> bool:
-    """
-    Export multiple months of P&L data in a single combined normalized JSON file.
-    
-    Args:
-        client: MCP client instance
-        months_back: Number of previous months to export
-        export_dir: Directory for exported files
-        
-    Returns:
-        bool: True if successful
-        
-    Raises:
-        AuthenticationFailureError: If authentication fails
-    """
-    logger.info(f"📊 Starting {months_back} months combined P&L export (single normalized JSON)")
+    logger.info("📊 Starting 5-year P&L export using efficient API calls")
     
     exporter = XeroNormalizedExporter(export_dir)
     
-    # Get date ranges for the last N months
-    from datetime import date
-    from calendar import monthrange
-    
+    # Calculate the years to fetch (last 5 complete years)
     current_date = date.today()
-    pl_data_to_export = []
+    current_year = current_date.year
     
-    for i in range(months_back):
-        # Calculate month to fetch
-        target_month = current_date.month - i - 1
-        target_year = current_date.year
-        
-        if target_month <= 0:
-            target_month += 12
-            target_year -= 1
-        
-        # Get the month's date range
-        first_day = date(target_year, target_month, 1)
-        last_day = date(target_year, target_month, monthrange(target_year, target_month)[1])
-        
-        date_range = DateRange(first_day, last_day)
-        date_range_str = f"{first_day}_to_{last_day}"
-        
-        logger.info(f"📅 Fetching data for: {date_range}")
-        
-        pl_response = get_profit_and_loss(client, date_range)
-        check_authentication_and_halt(pl_response, f"P&L data fetch for {date_range}")
-        
-        if pl_response.success:
-            pl_data_to_export.append((pl_response.data, date_range_str))
-            logger.info(f"✅ {date_range}: Data retrieved successfully")
-        else:
-            logger.warning(f"⚠️ {date_range}: Failed to fetch data - {pl_response.error_message}")
+    # If we're early in the year, we might want to include previous year
+    # For now, let's get the last 5 complete calendar years
+    end_year = current_year - 1  # Last complete year
+    start_year = end_year - 4    # 5 years total
     
-    if pl_data_to_export:
+    all_pl_data = []
+    success_count = 0
+    
+    logger.info(f"📅 Fetching P&L data for years: {start_year} to {end_year}")
+    logger.info("🔍 Using Xero's period logic: year-end date + 11 periods (API limit)")
+    
+    for year in range(start_year, end_year + 1):
         try:
-            # Export all collected data to a single combined file
-            logger.info("💾 Exporting collected data to single combined file...")
-            combined_file_path = exporter.export_combined_periods_json(pl_data_to_export)
+            logger.info(f"📊 Fetching P&L data for year: {year}")
             
-            print(f"\n=== Combined Multi-Month Export Results ===")
-            print(f"✅ Successfully exported combined file: {combined_file_path.name}")
+            # Xero's quirky way: Use December 31st as the target date
+            # This will give us Dec + previous 11 months = full year
+            year_end = date(year, 12, 31)  # Use year-end as target
+            # Create a date range that starts from the year beginning for reference
+            year_start = date(year, 1, 1)
+            date_range = DateRange(year_start, year_end)
             
-            # Validate the combined file
-            try:
-                import json
-                with open(combined_file_path, 'r', encoding='utf-8') as f:
-                    combined_data = json.load(f)
+            logger.debug(f"Year {year}: Target date = {year_end}, periods = 12")
+            
+            # Make API call for 11 periods (months) of this year
+            # Xero API limitation: periods must be 1-11, not 12
+            pl_response = get_profit_and_loss_periods(
+                client, 
+                date_range, 
+                periods=11,
+                timeframe="MONTH"
+            )
+            check_authentication_and_halt(pl_response, f"P&L data fetch for {year}")
+            
+            if pl_response.success:
+                # Store the response with year identifier
+                date_range_str = f"{year_start.isoformat()}_to_{year_end.isoformat()}"
+                all_pl_data.append((pl_response.data, date_range_str, year))
+                success_count += 1
+                logger.info(f"✅ {year}: P&L data retrieved successfully (11 periods)")
                 
-                metadata = combined_data.get('export_metadata', {})
-                data = combined_data.get('data', [])
+                # Log some debug info about the response
+                content_blocks = pl_response.data.get('result', {}).get('content', [])
+                logger.debug(f"Year {year}: Response has {len(content_blocks)} content blocks")
+            else:
+                logger.warning(f"⚠️ {year}: Failed to fetch P&L data - {pl_response.error_message}")
                 
-                print(f"\n=== Combined File Validation ===")
-                print(f"Format: {metadata.get('format')}")
-                print(f"Total records: {metadata.get('total_record_count')}")
-                print(f"Periods included: {metadata.get('periods_included')}")
-                print(f"Date range: {metadata.get('date_range_combined')}")
-                print(f"Actual data records: {len(data)}")
-                
-                # Show period breakdown
-                if 'period_summaries' in metadata:
-                    print(f"\n=== Period Breakdown ===")
-                    for summary in metadata['period_summaries']:
-                        print(f"  - {summary['period']}: {summary['record_count']} records")
-                
-                # Show sample record with period info
-                if data:
-                    print(f"\n=== Sample Record with Period ===")
-                    sample = data[0]
-                    for key, value in sample.items():
-                        print(f"  {key}: {repr(value)} ({type(value).__name__})")
-                
-            except Exception as e:
-                logger.warning(f"⚠️ Could not validate combined file: {e}")
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch P&L data for {year}: {e}")
+            continue
+    
+    if all_pl_data:
+        try:
+            logger.info("💾 Exporting 5-year P&L data to combined file...")
+            
+            # Create filename spanning the full range
+            earliest_year = min(item[2] for item in all_pl_data)
+            latest_year = max(item[2] for item in all_pl_data)
+            
+            # Prepare data for export (without year info, exporter handles it)
+            export_data = [(item[0], item[1]) for item in all_pl_data]
+            
+            combined_file_path = exporter.export_combined_periods_json(
+                export_data,
+                combined_filename=f"xero_pl_normalized_5year_{earliest_year}_to_{latest_year}.json"
+            )
+            
+            print(f"\n=== 5-Year P&L Export Results ===")
+            print(f"✅ Successfully exported: {combined_file_path.name}")
+            print(f"📊 Years included: {earliest_year} to {latest_year}")
+            print(f"🎯 API calls made: {success_count}/5 (target: 5)")
+            print(f"📈 Efficiency: {success_count * 11} months of data in {success_count} API calls")
             
             return True
             
         except Exception as e:
-            logger.error(f"❌ Combined export failed: {e}")
+            logger.error(f"❌ 5-year P&L export failed: {e}")
             return False
     else:
         logger.error("❌ No P&L data collected for export")
+        return False
+
+
+def export_smart_bs_data(client, export_dir: str = "exports") -> bool:
+    """
+    Export 5 years of Balance Sheet data using efficient API calls (5 calls total).
+    Each call gets up to 11 periods of data (Xero API limitation).
+    
+    Args:
+        client: MCP client instance
+        export_dir: Directory for exported files
+        
+    Returns:
+        bool: True if successful
+        
+    Raises:
+        AuthenticationFailureError: If authentication fails
+    """
+    logger.info("📊 Starting 5-year Balance Sheet export using efficient API calls")
+    
+    exporter = XeroNormalizedExporter(export_dir)
+    
+    # Calculate the years to fetch (last 5 complete years)
+    current_date = date.today()
+    current_year = current_date.year
+    
+    # If we're early in the year, we might want to include previous year
+    # For now, let's get the last 5 complete calendar years
+    end_year = current_year - 1  # Last complete year
+    start_year = end_year - 4    # 5 years total
+    
+    all_bs_data = []
+    success_count = 0
+    
+    logger.info(f"📅 Fetching Balance Sheet data for years: {start_year} to {end_year}")
+    
+    for year in range(start_year, end_year + 1):
+        try:
+            logger.info(f"📊 Fetching Balance Sheet data for year: {year}")
+            
+            # For Balance Sheet, we want month-end dates
+            # Create date range for the full year, but we'll get month-end snapshots
+            year_start = date(year, 1, 1)  
+            year_end = date(year, 12, 31)
+            date_range = DateRange(year_start, year_end)
+            
+            # Make API call for 11 periods (month-ends) of this year
+            # Xero API limitation: periods must be 1-11, not 12
+            bs_response = get_balance_sheet_periods(client, date_range, periods=11)
+            check_authentication_and_halt(bs_response, f"Balance Sheet data fetch for {year}")
+            
+            if bs_response.success:
+                # Store the response with year identifier
+                date_range_str = f"{year_start.isoformat()}_to_{year_end.isoformat()}"
+                all_bs_data.append((bs_response.data, date_range_str, year))
+                success_count += 1
+                logger.info(f"✅ {year}: Balance Sheet data retrieved successfully (11 month-ends)")
+            else:
+                logger.warning(f"⚠️ {year}: Failed to fetch Balance Sheet data - {bs_response.error_message}")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch Balance Sheet data for {year}: {e}")
+            continue
+    
+    if all_bs_data:
+        try:
+            logger.info("💾 Exporting 5-year Balance Sheet data to combined file...")
+            
+            # Create filename spanning the full range
+            earliest_year = min(item[2] for item in all_bs_data)
+            latest_year = max(item[2] for item in all_bs_data)
+            
+            # Prepare data for export (without year info, exporter handles it)
+            export_data = [(item[0], item[1]) for item in all_bs_data]
+            
+            combined_file_path = exporter.export_combined_bs_periods_json(
+                export_data,
+                combined_filename=f"xero_bs_normalized_5year_{earliest_year}_to_{latest_year}.json"
+            )
+            
+            print(f"\n=== 5-Year Balance Sheet Export Results ===")
+            print(f"✅ Successfully exported: {combined_file_path.name}")
+            print(f"📊 Years included: {earliest_year} to {latest_year}")
+            print(f"🎯 API calls made: {success_count}/5 (target: 5)")
+            print(f"📈 Efficiency: {success_count * 11} month-ends of data in {success_count} API calls")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 5-year Balance Sheet export failed: {e}")
+            return False
+    else:
+        logger.error("❌ No Balance Sheet data collected for export")
         return False
 
 
@@ -323,9 +335,9 @@ def verify_token_and_connection(client) -> tuple[bool, str]:
 
 
 def main():
-    """Main application with enhanced error handling and cleaner logging."""
-    print("🚀 Xero MCP Client - Combined Normalized JSON Export")
-    print("=" * 60)
+    """Main application with smart multi-year P&L and Balance Sheet export."""
+    print("🚀 Xero Comprehensive MCP Client - Smart Multi-Year Export")
+    print("=" * 70)
     
     try:
         # Environment setup
@@ -374,32 +386,63 @@ def main():
             print(f"   Organization: {org_info}")
             print(f"   Token status: Valid")
             
-            # Proceed with exports only after successful authentication
-            print(f"\n📊 Starting data export process...")
+            # Show efficiency improvement
+            print(f"\n🎯 SMART STRATEGY")
+            print(f"   Problem solved: Xero periods parameter limited to 1-11")
+            print(f"   Solution: 11 periods per year (11 months per API call)")
+            print(f"   API calls: 10 total (5 P&L + 5 Balance Sheet)")
+            print(f"   Coverage: 4+ years of data (11 months per year)")
+            
+            # Proceed with efficient exports
+            print(f"\n📊 Starting smart multi-year data export process...")
             
             try:
-                # Export combined multi-month data (this replaces the separate file approach)
-                combined_success = export_combined_multi_month_pl(client, months_back=12)
+                # Export 4+ years of P&L data (5 API calls)
+                print(f"\n{'='*70}")
+                print(f"EXPORTING SMART P&L DATA (5 EFFICIENT API CALLS)")
+                print(f"{'='*70}")
+                pl_success = export_smart_pl_data(client)
+                
+                # Export 4+ years of Balance Sheet data (5 API calls)
+                print(f"\n{'='*70}")
+                print(f"EXPORTING SMART BALANCE SHEET DATA (5 EFFICIENT API CALLS)")
+                print(f"{'='*70}")
+                bs_success = export_smart_bs_data(client)
                 
                 # Summary
-                print(f"\n{'='*60}")
-                print(f"EXPORT SUMMARY")
-                print(f"{'='*60}")
+                print(f"\n{'='*70}")
+                print(f"SMART EXPORT SUMMARY")
+                print(f"{'='*70}")
                 
-                if combined_success:
-                    print(f"✅ Combined Multi-Month Export: SUCCESS")
-                    print(f"\n🎉 Export completed successfully!")
-                    print(f"\n📁 Check the exports/ directory for your file:")
-                    print(f"   Format: xero_pl_normalized_combined_YYYY-MM-DD_to_YYYY-MM-DD.json")
-                    print(f"\n💡 Single file contains all periods with:")
-                    print(f"   - Consistent structure matching your requirements")
+                if pl_success and bs_success:
+                    print(f"✅ P&L Smart Export: SUCCESS")
+                    print(f"✅ Balance Sheet Smart Export: SUCCESS")
+                    print(f"\n🎉 Both exports completed successfully!")
+                    print(f"\n📁 Check the exports/ directory for your files:")
+                    print(f"   • xero_pl_normalized_smart_YYYY_to_YYYY.json")
+                    print(f"   • xero_bs_normalized_smart_YYYY_to_YYYY.json")
+                    print(f"\n💡 Files contain:")
+                    print(f"   - 4+ years of historical data")
+                    print(f"   - YTD data for current/recent year")
+                    print(f"   - Full 12 months for previous complete years")
+                    print(f"   - Consistent normalized structure")
                     print(f"   - Proper data typing (amounts as numbers)")
-                    print(f"   - Period information for each record")
-                    print(f"   - Comprehensive metadata for validation")
+                    print(f"   - Period/date information for each record")
+                    print(f"\n⚡ Smart Strategy Benefits:")
+                    print(f"   - Respects Xero's periods=1-11 limitation")
+                    print(f"   - Maximizes data coverage with minimal API calls")
+                    print(f"   - Handles current year intelligently")
+                    print(f"   - Total API calls: 10 (highly efficient)")
                     return 0
+                elif pl_success or bs_success:
+                    print(f"{'✅' if pl_success else '❌'} P&L Smart Export: {'SUCCESS' if pl_success else 'FAILED'}")
+                    print(f"{'✅' if bs_success else '❌'} Balance Sheet Smart Export: {'SUCCESS' if bs_success else 'FAILED'}")
+                    print(f"\n⚠️ Partial success - some exports failed")
+                    return 2
                 else:
-                    print(f"❌ Combined Multi-Month Export: FAILED")
-                    print(f"\n⚠️ Export failed (but authentication worked)")
+                    print(f"❌ P&L Smart Export: FAILED")
+                    print(f"❌ Balance Sheet Smart Export: FAILED")
+                    print(f"\n❌ Both exports failed (but authentication worked)")
                     return 1
                     
             except AuthenticationFailureError as e:

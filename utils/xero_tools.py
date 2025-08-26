@@ -3,8 +3,8 @@
 utils/xero_tools.py
 
 Professional Xero API wrapper functions using MCP client.
-Includes data models, error handling, and comprehensive business logic.
-Enhanced with better authentication error detection and logging.
+Includes data models, error handling, and efficient multi-period API calls.
+Enhanced with better authentication error detection and periods support.
 """
 
 from __future__ import annotations
@@ -419,6 +419,78 @@ def get_profit_and_loss(
         )
 
 
+def get_profit_and_loss_periods(
+    client: MCPClient,
+    date_range: DateRange,
+    periods: int = 12,
+    timeframe: str = "MONTH",
+    standard_layout: bool = True
+) -> XeroToolResponse:
+    """
+    Get Profit & Loss report for specified date range with multiple periods.
+    This is the efficient version that gets up to 11 months in a single API call.
+    
+    Args:
+        client: MCP client instance
+        date_range: Date range for the report (typically a full year)
+        periods: Number of periods to retrieve (max 11, typically months)
+        timeframe: Time frame for periods ("MONTH", "QUARTER", "YEAR")
+        standard_layout: Whether to use standard layout
+        
+    Returns:
+        XeroToolResponse: P&L report data with multiple periods
+    """
+    start_time = datetime.now()
+    
+    try:
+        logger.debug(f"📊 Fetching P&L report with {periods} {timeframe.lower()}s for {date_range}")
+        
+        arguments = date_range.to_iso_dict()
+        arguments["periods"] = periods
+        arguments["timeframe"] = timeframe
+        arguments["standardLayout"] = standard_layout
+        
+        logger.debug(f"P&L API arguments: {arguments}")
+        
+        response = client.call_tool("list-profit-and-loss", arguments)
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        logger.debug(f"✅ P&L periods call completed in {execution_time:.2f}s")
+        
+        return XeroToolResponse(
+            success=True,
+            data=response,
+            tool_name="list-profit-and-loss",
+            execution_time=execution_time
+        )
+        
+    except MCPAuthenticationError as e:
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        return XeroToolResponse(
+            success=False,
+            data=None,
+            tool_name="list-profit-and-loss", 
+            execution_time=execution_time,
+            error_message=str(e),
+            is_auth_error=True
+        )
+        
+    except MCPError as e:
+        execution_time = (datetime.now() - start_time).total_seconds()
+        error_msg = str(e)
+        is_auth = is_authentication_error(error_msg)
+        
+        return XeroToolResponse(
+            success=False,
+            data=None,
+            tool_name="list-profit-and-loss", 
+            execution_time=execution_time,
+            error_message=error_msg,
+            is_auth_error=is_auth
+        )
+
+
 def get_balance_sheet(
     client: MCPClient,
     as_at_date: date,
@@ -446,6 +518,82 @@ def get_balance_sheet(
         })
         
         execution_time = (datetime.now() - start_time).total_seconds()
+        
+        return XeroToolResponse(
+            success=True,
+            data=response,
+            tool_name="list-report-balance-sheet",
+            execution_time=execution_time
+        )
+        
+    except MCPAuthenticationError as e:
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        return XeroToolResponse(
+            success=False,
+            data=None,
+            tool_name="list-report-balance-sheet",
+            execution_time=execution_time,
+            error_message=str(e),
+            is_auth_error=True
+        )
+        
+    except MCPError as e:
+        execution_time = (datetime.now() - start_time).total_seconds()
+        error_msg = str(e)
+        is_auth = is_authentication_error(error_msg)
+        
+        return XeroToolResponse(
+            success=False,
+            data=None,
+            tool_name="list-report-balance-sheet",
+            execution_time=execution_time,
+            error_message=error_msg,
+            is_auth_error=is_auth
+        )
+
+
+def get_balance_sheet_periods(
+    client: MCPClient,
+    date_range: DateRange,
+    periods: int = 12,
+    timeframe: str = "MONTH",
+    standard_layout: bool = True
+) -> XeroToolResponse:
+    """
+    Get Balance Sheet report with multiple periods (month-ends).
+    This is the efficient version that gets up to 11 month-ends in a single API call.
+    
+    Args:
+        client: MCP client instance
+        date_range: Date range for the report (typically a full year)
+        periods: Number of periods to retrieve (max 11, typically month-ends)
+        timeframe: Time frame for periods ("MONTH", "QUARTER", "YEAR")
+        standard_layout: Whether to use standard layout
+        
+    Returns:
+        XeroToolResponse: Balance sheet data with multiple periods
+    """
+    start_time = datetime.now()
+    
+    try:
+        logger.debug(f"📈 Fetching Balance Sheet with {periods} {timeframe.lower()}s for {date_range}")
+        
+        # For Balance Sheet periods, we use the end date and work backwards
+        # The API will give us month-end snapshots
+        arguments = {
+            "date": date_range.end_date.isoformat(),
+            "periods": periods,
+            "timeframe": timeframe,
+            "standardLayout": standard_layout
+        }
+        
+        logger.debug(f"Balance Sheet API arguments: {arguments}")
+        
+        response = client.call_tool("list-report-balance-sheet", arguments)
+        execution_time = (datetime.now() - start_time).total_seconds()
+        
+        logger.debug(f"✅ Balance Sheet periods call completed in {execution_time:.2f}s")
         
         return XeroToolResponse(
             success=True,
@@ -619,46 +767,80 @@ def get_invoices(
 
 # ---------- Convenience Functions ----------
 
-def get_monthly_pl_summary(client: MCPClient, months_back: int = 3) -> List[XeroToolResponse]:
+def get_efficient_yearly_pl_data(client: MCPClient, years: List[int]) -> List[XeroToolResponse]:
     """
-    Get P&L summaries for the last N complete months.
+    Get P&L data for multiple years using efficient API calls.
+    Each year is fetched with 12 periods in a single API call.
     
     Args:
         client: MCP client instance
-        months_back: Number of months to fetch (default 3)
+        years: List of years to fetch (e.g., [2020, 2021, 2022, 2023, 2024])
         
     Returns:
-        List[XeroToolResponse]: P&L responses for each month
+        List[XeroToolResponse]: P&L responses for each year
     """
     results = []
-    current_date = date.today()
     
-    for i in range(months_back):
-        # Calculate the month to fetch
-        target_month = current_date.month - i - 1
-        target_year = current_date.year
+    for year in years:
+        logger.info(f"📊 Fetching P&L data for {year} (12 periods)")
         
-        if target_month <= 0:
-            target_month += 12
-            target_year -= 1
+        # Create date range for the full year
+        year_start = date(year, 1, 1)
+        year_end = date(year, 12, 31)
+        date_range = DateRange(year_start, year_end)
         
-        # Get the month's date range
-        first_day = date(target_year, target_month, 1)
-        if target_month == 12:
-            last_day = date(target_year + 1, 1, 1) - timedelta(days=1)
-        else:
-            last_day = date(target_year, target_month + 1, 1) - timedelta(days=1)
-        
-        date_range = DateRange(first_day, last_day)
-        
-        logger.debug(f"Fetching P&L for {date_range}")
-        pl_response = get_profit_and_loss(client, date_range)
+        # Fetch 11 periods (months) in one API call (Xero API limit)
+        pl_response = get_profit_and_loss_periods(client, date_range, periods=11)
         results.append(pl_response)
         
         # If we hit an auth error, stop trying
         if pl_response.is_auth_error:
-            logger.warning("Authentication error detected, stopping monthly fetch")
+            logger.warning("Authentication error detected, stopping yearly fetch")
             break
+            
+        if pl_response.success:
+            logger.info(f"✅ {year}: Successfully fetched 11 months of P&L data")
+        else:
+            logger.warning(f"⚠️ {year}: Failed to fetch P&L data - {pl_response.error_message}")
+    
+    return results
+
+
+def get_efficient_yearly_bs_data(client: MCPClient, years: List[int]) -> List[XeroToolResponse]:
+    """
+    Get Balance Sheet data for multiple years using efficient API calls.
+    Each year is fetched with 12 periods (month-ends) in a single API call.
+    
+    Args:
+        client: MCP client instance
+        years: List of years to fetch (e.g., [2020, 2021, 2022, 2023, 2024])
+        
+    Returns:
+        List[XeroToolResponse]: Balance Sheet responses for each year
+    """
+    results = []
+    
+    for year in years:
+        logger.info(f"📈 Fetching Balance Sheet data for {year} (12 month-ends)")
+        
+        # Create date range for the full year
+        year_start = date(year, 1, 1)
+        year_end = date(year, 12, 31)
+        date_range = DateRange(year_start, year_end)
+        
+        # Fetch 11 periods (month-ends) in one API call (Xero API limit)
+        bs_response = get_balance_sheet_periods(client, date_range, periods=11)
+        results.append(bs_response)
+        
+        # If we hit an auth error, stop trying
+        if bs_response.is_auth_error:
+            logger.warning("Authentication error detected, stopping yearly fetch")
+            break
+            
+        if bs_response.success:
+            logger.info(f"✅ {year}: Successfully fetched 11 month-ends of Balance Sheet data")
+        else:
+            logger.warning(f"⚠️ {year}: Failed to fetch Balance Sheet data - {bs_response.error_message}")
     
     return results
 
