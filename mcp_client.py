@@ -2,11 +2,13 @@ import asyncio
 import json
 import os
 import shutil
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from contextlib import AsyncExitStack
-from datetime import datetime
-import csv
+from datetime import datetime, date
 import re
+import csv
+from collections import defaultdict
+from decimal import Decimal
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -18,7 +20,6 @@ from google.genai import types
 # ------------ Optional UX libs (graceful fallback) ------------
 USE_RICH = True
 USE_PTK = True
-USE_CLIP = True
 try:
     from rich.console import Console
     from rich.table import Table
@@ -26,7 +27,6 @@ try:
     from rich.text import Text
     from rich.align import Align
     from rich.box import ROUNDED
-    from rich.prompt import Confirm
     from rich.style import Style
 except Exception:
     USE_RICH = False
@@ -36,46 +36,210 @@ try:
     from prompt_toolkit.completion import WordCompleter
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.formatted_text import HTML as PTK_HTML
+    from prompt_toolkit.patch_stdout import patch_stdout
 except Exception:
     USE_PTK = False
 
-try:
-    import pyperclip
-except Exception:
-    USE_CLIP = False
-
 # ---------------- Config ----------------
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-SHOW_THINKING = os.environ.get("SHOW_THINKING", "true").lower() in ("true", "1", "yes")
-SYSTEM = (
-    "You are a specialized Xero financial data assistant with access to Xero via MCP tools. "
-    "You excel at analyzing Balance Sheets and Profit & Loss statements, providing clear financial insights. "
-    
-    "When working with financial data:\n"
-    "- For Balance Sheet requests: Focus on assets, liabilities, and equity positions\n"
-    "- For P&L requests: Analyze revenue, expenses, and profitability trends\n"
-    "- Always highlight key financial metrics and ratios when relevant\n"
-    "- Identify significant changes or anomalies in financial data\n"
-    "- Present data in a structured, easy-to-understand format\n"
-    "- When showing multi-period data, calculate and highlight period-over-period changes\n"
-    
-    "For any Xero data requests:\n"
-    "- Choose the most appropriate MCP tool for the task\n"
-    "- Summarize key findings from the data\n"
-    "- Be concise but comprehensive in your analysis\n"
-    "- Always provide context for financial figures (e.g., currency, time periods)\n"
-    "- Suggest follow-up questions or related analyses when appropriate"
-)
-
 APP_NAME = "Xero Assistant"
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+SYSTEM = r"""
+# Xero Financial Copilot — System Instruction (v2)
+
+You are a senior financial analyst + Xero copilot that **executes tasks** via MCP tools and returns decision-ready answers. Favor **doing** over caveats. If the exact report doesn’t exist, orchestrate an **alternative plan** using available tools (list endpoints + client-side aggregation). Ask **once** only if a task is heavy (see “Asking Policy”), then execute.
+
+---
+
+## 0) Safety & redaction (always)
+- **Never** surface credentials or raw headers. If a tool payload mentions `Authorization`, tokens, cookies, or account numbers, **redact** to last 4 chars before showing anything to the user.
+- If a tool returns a verbose error blob, summarize it (status, message) and provide the concrete fix; do not paste raw tokens/IDs.
+
+---
+
+## 1) Defaults & date normalization (no back-and-forth)
+Resolve vague timeframes **without asking**:
+- “this month” → first to last day of the current calendar month.
+- “this year” → Jan 1 to Dec 31 of the current calendar year. If asked for YTD, use Jan 1 → today.
+- “last month” → previous calendar month.
+- “last 12 months (LTM)” → rolling 12 complete months ending last month.
+- Quarters: Q1=Jan–Mar; Q2=Apr–Jun; Q3=Jul–Sep; Q4=Oct–Dec.
+- If the user later corrects dates, re-run with their exact range.
+
+Other defaults:
+- Page size 20; newest first.
+- Currency: show **currency codes** (AUD, NZD, etc.).
+- Rounding: 2 decimals for money, thousands separators; show totals.
+
+State the defaults you used under **Assumptions & Filters**.
+
+---
+
+## 2) Input normalization → tool routing
+Map user phrasing to the most specific tool:
+
+- “org details”, “organisation info” → **list-organisation-details**
+- “profit and loss”, “P&L” → **list-profit-and-loss**
+- “balance sheet” → **list-report-balance-sheet** (needs as-of date; use period end)
+- “trial balance” → **list-trial-balance**
+- “bank transactions” → **list-bank-transactions** (support date/account filters)
+- “invoices / quotes / credit notes / payments” → **list-*** with appropriate filters
+- “aged AR/AP by contact” → **list-aged-receivables-by-contact** / **list-aged-payables-by-contact**
+- “contacts/items/accounts/taxes” → **list-contacts**, **list-items**, **list-accounts**, **list-tax-rates**
+- Payroll/timesheets/tracking → the matching list/update tools; be explicit about period/scope.
+
+If a user asks to “create/update” an object, route to the corresponding **create-*** or **update-*** tool with minimal required fields and sensible defaults, then confirm what was changed.
+
+---
+
+## 3) Pagination & client-side aggregation (use meta-args our client understands)
+When the task implies “all”, a summary, or big ranges, request client help:
+
+- `_auto_page: true` → fetch to the end (bounded by a safety cap).
+- `_summarize: "invoices"` → client parses and aggregates invoice totals (e.g., by contact/date/type).
+- `_filters: {from:"YYYY-MM-DD", to:"YYYY-MM-DD", type:"ACCREC|ACCPAY"}` → client applies post-fetch filters.
+
+Prefer the most specific list endpoint and let the client auto-page + aggregate.
+
+---
+
+## 4) Report recipes (do, don’t ask)
+
+### 4.1 Profit & Loss — monthly view for a year
+Issue with Xero API: `periods` must be **1–11** in some modes. Do **not** ask the user about this. Use one of these tactics automatically:
+
+**Preferred:** Call **list-profit-and-loss** with `fromDate`=`YYYY-01-01`, `toDate`=`YYYY-12-31`, `timeframe=MONTH` **without** `periods`, if the tool supports it.
+
+**Fallback (when periods is enforced 1–11):**
+- Run 2 calls:
+  - Call A: `fromDate=YYYY-01-01`, `toDate=YYYY-11-30`, `timeframe=MONTH`, `periods=11`
+  - Call B: `fromDate=YYYY-12-01`, `toDate=YYYY-12-31`, `timeframe=MONTH`, `periods=1`
+- Combine the 12 months client-side and present a single table.
+
+**If the tool exposes only a single month:** loop months Jan→Dec (≤12 calls, allowed by Asking Policy), aggregate client-side.
+
+Always present: Revenue, COGS, Gross Profit, Opex, Net Profit per month; include totals and (if applicable) YoY or MoM deltas.
+
+### 4.2 Balance Sheet
+- Use **list-report-balance-sheet** with `asOfDate` = requested end date; if a range is given, show **end-of-period** snapshot and (optionally) compare with start.
+
+### 4.3 Cash movement from bank transactions (proxy cash-flow)
+- Use **list-bank-transactions** with date range; compute **inflow**, **outflow**, **net cash**, top counterparties, and largest 5 transactions.
+- Support filters: account, type (RECEIVE/SPEND), and tracking (if exposed).
+
+### 4.4 Invoices KPIs
+- Use **list-invoices** with `_auto_page: true` and `_summarize: "invoices"`.
+- Common asks:
+  - “overdue now” → filter by status + dueDate < today.
+  - “top debtors last 90 days” → filter date range + type=ACCREC; show top contacts by outstanding.
+  - “collections this month” → filter payments or invoices with status PAID, group by day/contact.
+
+### 4.5 Aged AR/AP by contact
+- Use **list-aged-receivables-by-contact** / **list-aged-payables-by-contact**, optionally scoped to a named contact.
+
+### 4.6 Tracking categories
+- If user asks “by region/class/project”, pass tracking filters where the tool supports them; otherwise fetch and **group client-side**.
+
+---
+
+## 5) Asking Policy (minimize friction)
+- Proceed **without asking** if the plan needs **≤12 tool calls** or **≤10 auto-pages**.
+- If more than that, ask **once**: “This will run ~N calls/pages; OK to proceed?”
+- On **rate-limit** or **auth** errors, retry once with smaller scope; otherwise return the 1-line diagnosis + fix.
+
+---
+
+## 6) Error-recovery playbooks (examples)
+- **P&L 400: “periods 1–11”** → Switch to the **two-call** or **per-month loop** strategy and proceed.
+- **From/To + Periods conflict** → Remove `periods` and rely on `fromDate`/`toDate` + `timeframe`.
+- **Scope/auth** → Ask the user to re-auth or add scope (state the missing scope).
+- **Empty data** → Say it plainly and suggest the next concrete step (expand range, different status, include other orgs).
+
+---
+
+## 7) Output Contract (always visible text)
+Structure every answer:
+
+1) **Direct answer** — 1 short paragraph with the headline result.
+2) **Key metrics** — bullets with numbers.
+3) **Details** — compact table or concise bullets (top rows/aggregates). For monthly P&L, show Month, Revenue, COGS, GP, Opex, Net.
+4) **Assumptions & Filters** — exact dates, statuses, currency, defaults used, and any redactions applied.
+5) **Next steps** — 1–2 precise follow-ups or actions (e.g., “drill into July variance by contact?”).
+
+Use absolute dates (YYYY-MM-DD). Prefer aggregates to raw dumps.
+
+---
+
+## 8) Examples (follow these patterns)
+
+- **“How much profit did we make each month this year?”**
+  - Resolve “this year” → current calendar year (Jan 1–Dec 31).
+  - Try P&L with timeframe=MONTH (no periods). If rejected, run 2-call or 12-call fallback. Present 12-row table.
+
+- **“Show cash received and paid last month, and top 5 vendors.”**
+  - list-bank-transactions with last month, compute inflow/outflow/net, group vendors; show top 5.
+
+- **“Which customers owe us the most in the last 90 days?”**
+  - list-invoices with `_auto_page: true`, `_summarize: "invoices"`, `_filters` last 90 days, type=ACCREC; show top contacts with outstanding.
+
+- **“Balance sheet as of 2025-06-30?”**
+  - list-report-balance-sheet with asOf=2025-06-30; show assets/liabilities/equity totals and key ratios.
+
+---
+
+## 9) Final reminders
+- Think briefly, then act; chain only when needed.
+- Prefer the most specific tool; let the client auto-page and summarize when available.
+- If something truly cannot be done, propose the closest viable alternative and ask **once** if heavy; then execute.
+- Return **only** user-visible text (plain or markdown). Never include raw headers, tokens, or giant payloads.
+
+"""
+
+
+# Thinking toggle actually controls generation + budget
+# Default OFF for cleaner UX; toggle with /thinking
+SHOW_THINKING = os.environ.get("SHOW_THINKING", "false").lower() in ("true", "1", "yes")
+THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "-1"))  # -1 dynamic, 0 off, >0 fixed tokens
+
+# History/windowing
 HISTORY_PATH = os.path.expanduser("~/.xero_mcp_history")
-DEFAULT_PAGE_SIZE = 20  # overridden by terminal height if possible
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "24"))  # rough bound on conversation length
+
+# Tool-call loop guardrails
+MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "6"))
+
+# Auto-paging safety
+AUTO_PAGE_MAX = int(os.environ.get("AUTO_PAGE_MAX", "15"))  # cap pages when _auto_page is on
+
+# UI + paging defaults
+DEFAULT_PAGE_SIZE = 20
 MIN_PAGE_SIZE = 8
 
 console = Console() if USE_RICH else None
 
-# ---------------------- MCP result helpers ----------------------
+# ---------------------- Generic helpers ----------------------
+def pretty_json(data: Any) -> str:
+    try:
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception:
+        return str(data)
+
+def truncate_str(s: str, limit: int = 2000) -> str:
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"\n… [truncated {len(s)-limit} chars]"
+
+def sizeof_json(obj: Any) -> int:
+    try:
+        return len(json.dumps(obj, ensure_ascii=False))
+    except Exception:
+        return 0
+
+# ---------------------- MCP result normalization ----------------------
 def _flatten_mcp_result(result) -> dict:
+    """
+    Normalize MCP tool result into a simple payload:
+      {"ok": bool, "parts": [{"type":"text","text":...} | {"type":"json","json":...} | ...], "message":str?}
+    """
     payload = {"ok": not getattr(result, "isError", False), "parts": []}
     for c in getattr(result, "content", []) or []:
         typ = getattr(c, "type", None)
@@ -84,158 +248,94 @@ def _flatten_mcp_result(result) -> dict:
         elif typ == "json":
             payload["parts"].append({"type": "json", "json": getattr(c, "json", None)})
         else:
-            payload["parts"].append({"type": "unknown", "value": repr(c)})
+            payload["parts"].append({"type": str(typ) or "unknown", "value": repr(c)})
     msg = getattr(result, "message", None)
     if msg:
         payload["message"] = msg
     return payload
 
-def _extract_contacts(payload: dict) -> List[Dict[str, Any]]:
-    for part in payload.get("parts", []):
-        if part.get("type") == "json":
-            data = part.get("json")
-            if isinstance(data, dict):
-                for key in ("Contacts", "contacts", "items", "data", "results"):
-                    val = data.get(key)
-                    if isinstance(val, list) and (not val or isinstance(val[0], dict)):
-                        return val
-            if isinstance(data, list) and (not data or isinstance(data[0], dict)):
-                return data
-    return []
-
-def _get_str(d: Dict[str, Any], *keys: str):
-    for k in keys:
-        v = d.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-def _fmt_name(c: Dict[str, Any]):
-    name = _get_str(c, "Name", "name", "ContactName", "contactName")
-    if name:
-        return name
-    fn = _get_str(c, "FirstName", "firstName")
-    ln = _get_str(c, "LastName", "lastName")
-    if fn or ln:
-        return (" ".join(filter(None, [fn, ln]))).strip()
-    return "(no name)"
-
-def _fmt_email(c: Dict[str, Any]):
-    email = _get_str(c, "EmailAddress", "emailAddress", "email", "primaryEmail")
-    if email:
-        return email
-    if isinstance(c.get("Emails"), list) and c["Emails"]:
-        e0 = c["Emails"][0]
-        if isinstance(e0, dict):
-            return _get_str(e0, "Address", "address", "email") or ""
-    return ""
-
-def _fmt_phone(c: Dict[str, Any]):
-    # Try common shapes
-    phone = _get_str(c, "PhoneNumber", "phone", "primaryPhone", "Mobile", "mobile")
-    if phone:
-        return phone
-    phones = c.get("Phones") or c.get("phones")
-    if isinstance(phones, list) and phones:
-        p0 = phones[0]
-        if isinstance(p0, dict):
-            return _get_str(p0, "PhoneNumber", "phoneNumber", "number") or ""
-    return ""
-
 # ---------------------- Thinking helpers ----------------------
 def extract_thinking(response) -> Optional[str]:
-    """Return the human-readable thought summary text (not the signature)."""
+    """
+    Return human-readable thought summaries only.
+    We show only parts where part.thought == True and part.text exists.
+    """
     if not getattr(response, "candidates", None):
         return None
-
     pieces: List[str] = []
     for cand in response.candidates or []:
         content = getattr(cand, "content", None)
         if not content or not getattr(content, "parts", None):
             continue
         for part in content.parts or []:
-            # Only show text parts explicitly marked as thoughts
             if getattr(part, "thought", False) and getattr(part, "text", None):
                 pieces.append(part.text)
-
-    return "\n".join(pieces).strip() if pieces else None
-
+    txt = "\n".join(pieces).strip() if pieces else None
+    return txt or None
 
 def display_thinking(thinking_text: str):
-    """Display the thinking process in a visually distinct way."""
     if not thinking_text or not thinking_text.strip():
         return
-    
-    # Don't display if it's just "True" or similar boolean values
-    if thinking_text.strip().lower() in ('true', 'false', '1', '0'):
-        return
-        
     if USE_RICH:
-        # Create a subtle, collapsible-style display for thinking
         thinking_panel = Panel(
-            thinking_text.strip(),
-            title="Thinking Process...",
+            truncate_str(thinking_text.strip(), 4000),
+            title="Thinking Process",
             title_align="left",
             box=ROUNDED,
             style="dim",
             border_style="dim blue",
-            padding=(0, 1)
+            padding=(0, 1),
         )
         console.print(thinking_panel)
     else:
-        # Simple text display for non-rich environments
         print("\n🤔 Thinking Process:")
         print("-" * 40)
-        # Indent the thinking text slightly
-        for line in thinking_text.strip().split('\n'):
+        for line in thinking_text.strip().split("\n"):
             print(f"  {line}")
         print("-" * 40)
 
 def extract_text_response(response) -> str:
-    """Return only the normal answer text (exclude thought summaries/signatures)."""
+    """
+    Collect user-visible text. If empty (sometimes happens when include_thoughts=True),
+    fall back to the first thought text so the UI never stays blank.
+    """
     if not getattr(response, "candidates", None):
         return ""
     out: List[str] = []
-    for cand in response.candidates or []:
-        content = getattr(cand, "content", None)
-        if not content or not getattr(content, "parts", None):
-            continue
-        for part in content.parts or []:
-            # Keep non-thought text only; ignore thought text and any signatures
-            if getattr(part, "text", None) and not getattr(part, "thought", False):
-                out.append(part.text)
-    return "".join(out)
 
-# ---------------------- UX helpers ----------------------
-def banner():
-    thinking_status = "ON" if SHOW_THINKING else "OFF"
+    cand = (response.candidates or [None])[0]
+    if not cand or not getattr(cand, "content", None) or not getattr(cand.content, "parts", None):
+        return ""
+
+    # 1) Prefer non-thought text
+    for part in cand.content.parts or []:
+        if getattr(part, "text", None) and not getattr(part, "thought", False):
+            out.append(part.text)
+
+    if out:
+        return "".join(out)
+
+    # 2) Fallback: if nothing user-visible, pick the first thought text (when thinking is enabled)
+    for part in cand.content.parts or []:
+        if getattr(part, "thought", False) and getattr(part, "text", None):
+            return part.text
+
+    return ""
+
+# ---------------------- UI helpers ----------------------
+def banner(thinking_on: bool):
+    thinking_status = "ON" if thinking_on else "OFF"
     if USE_RICH:
         title = Text(APP_NAME, style="bold cyan")
-        subtitle = Text(f"Connected to Xero MCP · Model: {MODEL} · Thinking: {thinking_status} · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                        style="dim")
+        subtitle = Text(
+            f"Connected to Xero MCP · Model: {MODEL} · Thinking: {thinking_status} · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            style="dim",
+        )
         console.print(Panel(Align.center(Text.assemble(title, "\n", subtitle)), box=ROUNDED))
     else:
         print(f"{APP_NAME} — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         print(f"Model: {MODEL} · Thinking: {thinking_status}")
         print("-" * 60)
-
-def tip_quick_actions():
-    tips = [
-        "[bold]/contacts[/bold] list Xero contacts",
-        "[bold]/filter john[/bold] filter by name/email",
-        "[bold]/view 7[/bold] see full details of item 7 on the page",
-        "[bold]/copy 7[/bold] copy email of item 7",
-        "[bold]/export csv contacts.csv[/bold]  or  [bold]/export md out.md[/bold]  or  [bold]/export json out.json[/bold]",
-        "[bold]/page 2[/bold] · [bold]/more[/bold] · [bold]/page_size 30[/bold]",
-        "[bold]/thinking[/bold] toggle AI thinking display",
-        "[bold]/help[/bold] to see all commands",
-    ]
-    if USE_RICH:
-        console.print(Panel("\n".join(tips), title="Quick actions", box=ROUNDED))
-    else:
-        print("Quick actions:")
-        for t in tips:
-            print(" -", re.sub(r"\[/?bold\]", "", t))
 
 def info(msg: str):
     if USE_RICH:
@@ -262,126 +362,357 @@ def error(msg: str):
         print("[x]", msg)
 
 def spinner(msg: str):
-    # A no-op context manager if rich absent
     class Dummy:
-        def __enter__(self): 
-            if not USE_RICH: print(msg + "...")
-        def __exit__(self, exc_type, exc, tb): 
+        def __enter__(self):
+            if not USE_RICH:
+                print(msg + "...")
+        def __exit__(self, exc_type, exc, tb):
             pass
     return console.status(msg) if USE_RICH else Dummy()
 
-# ---------------------- Contacts table rendering ----------------------
-def _plain_contacts_table(contacts: List[Dict[str, Any]], page: int, page_size: int, filter_text: Optional[str] = None):
-    items = contacts
-    if filter_text:
-        pat = re.compile(re.escape(filter_text), re.IGNORECASE)
-        def match(c):
-            n = _fmt_name(c)
-            e = _fmt_email(c)
-            return (n and pat.search(n)) or (e and pat.search(e))
-        items = [c for c in items if match(c)]
+def render_json_table_if_applicable(payload: dict):
+    """
+    Generic renderer: if top-level is a list[dict], render a table of common keys; else pretty JSON.
+    """
+    # Try to find a list[dict] inside payload["parts"] json parts
+    rows: Optional[List[Dict[str, Any]]] = None
+    if not payload:
+        return
+    for p in payload.get("parts", []):
+        if p.get("type") == "json":
+            data = p.get("json")
+            # Accept raw list[dict] or dict with known collection keys
+            if isinstance(data, list) and (not data or isinstance(data[0], dict)):
+                rows = data
+                break
+            if isinstance(data, dict):
+                for k in (
+                    "items",
+                    "results",
+                    "data",
+                    "contacts",
+                    "Contacts",
+                    "transactions",
+                    "Transactions",
+                    "invoices_rows",
+                    "totals_by_contact"
+                ):
+                    v = data.get(k)
+                    if isinstance(v, list) and (not v or isinstance(v[0], dict)):
+                        rows = v
+                        break
+        if rows:
+            break
 
-    total = len(items)
-    if total == 0:
-        print("No contacts found.")
-        return [], 0, 0, 0
+    if rows is None:
+        # Fallback: print JSON payload
+        body = pretty_json(payload)
+        if USE_RICH:
+            console.print(Panel(truncate_str(body, 12000), title="Tool Payload", box=ROUNDED, style="dim"))
+        else:
+            print("\nTool Payload:\n" + body)
+        return
 
-    start = max(0, (page - 1) * page_size)
-    end = min(total, start + page_size)
-    slice_ = items[start:end]
+    # Render table of first N rows and selected keys
+    max_rows = 20
+    sample = rows[:max_rows]
+    # Choose up to 6 interesting keys (union of first few rows)
+    keys: List[str] = []
+    for r in sample[:5]:
+        if isinstance(r, dict):
+            for k in r.keys():
+                if k not in keys:
+                    keys.append(k)
+                if len(keys) >= 6:
+                    break
+        if len(keys) >= 6:
+            break
+    keys = keys or ["id", "name", "date", "amount"]  # fallback
 
-    rows: List[Tuple[str, str, str]] = [(_fmt_name(c), _fmt_email(c), _fmt_phone(c)) for c in slice_]
-    name_w = max(len("Name"), *(len(r[0]) for r in rows)) if rows else len("Name")
-    email_w = max(len("Email"), *(len(r[1]) for r in rows)) if rows else len("Email")
-    phone_w = max(len("Phone"), *(len(r[2]) for r in rows)) if rows else len("Phone")
-
-    print(f"\nContacts {start+1}-{end} of {total}" + (f" (filtered by '{filter_text}')" if filter_text else ""))
-    print("-" * (name_w + email_w + phone_w + 9))
-    print(f"| {'#':>3} | {'Name'.ljust(name_w)} | {'Email'.ljust(email_w)} | {'Phone'.ljust(phone_w)} |")
-    print("-" * (name_w + email_w + phone_w + 9))
-    for i, (n, e, p) in enumerate(rows, start=start+1):
-        print(f"| {str(i).rjust(3)} | {n.ljust(name_w)} | {e.ljust(email_w)} | {p.ljust(phone_w)} |")
-    print("-" * (name_w + email_w + phone_w + 9))
-    return slice_, total, start+1, end
-
-def _rich_contacts_table(contacts: List[Dict[str, Any]], page: int, page_size: int, filter_text: Optional[str] = None):
-    items = contacts
-    if filter_text:
-        pat = re.compile(re.escape(filter_text), re.IGNORECASE)
-        def match(c):
-            n = _fmt_name(c)
-            e = _fmt_email(c)
-            return (n and pat.search(n)) or (e and pat.search(e))
-        items = [c for c in items if match(c)]
-
-    total = len(items)
-    if total == 0:
-        console.print(Panel("No contacts found.", style="dim"))
-        return [], 0, 0, 0
-
-    start = max(0, (page - 1) * page_size)
-    end = min(total, start + page_size)
-    slice_ = items[start:end]
-
-    table = Table(box=ROUNDED, show_lines=False, title=f"Contacts {start+1}-{end} of {total}" + (f" • filter: '{filter_text}'" if filter_text else ""))
-    table.add_column("#", justify="right", style="dim", width=4)
-    table.add_column("Name", style="bold")
-    table.add_column("Email")
-    table.add_column("Phone", style="dim")
-
-    for idx, c in enumerate(slice_, start=start+1):
-        table.add_row(str(idx), _fmt_name(c), _fmt_email(c), _fmt_phone(c))
-
-    console.print(table)
-    return slice_, total, start+1, end
-
-def render_contacts_table(contacts: List[Dict[str, Any]], page: int, page_size: int, filter_text: Optional[str] = None):
     if USE_RICH:
-        return _rich_contacts_table(contacts, page, page_size, filter_text)
-    return _plain_contacts_table(contacts, page, page_size, filter_text)
+        table = Table(box=ROUNDED, show_lines=False, title=f"Items (showing {len(sample)} of {len(rows)})")
+        table.add_column("#", justify="right", style="dim", width=4)
+        for k in keys:
+            table.add_column(str(k))
+        for i, r in enumerate(sample, 1):
+            if isinstance(r, dict):
+                table.add_row(str(i), *[str(r.get(k, ""))[:80] for k in keys])
+            else:
+                table.add_row(str(i), *([""] * len(keys)))
+        console.print(table)
+    else:
+        print(f"\nItems (showing {len(sample)} of {len(rows)}):")
+        header = " | ".join(keys)
+        print(f"# | {header}")
+        for i, r in enumerate(sample, 1):
+            if isinstance(r, dict):
+                print(f"{i} | " + " | ".join(str(r.get(k, ""))[:80] for k in keys))
+            else:
+                print(f"{i} | " + " | ".join([""] * len(keys)))
 
-def pretty_json(data: Any) -> str:
-    try:
-        return json.dumps(data, indent=2, ensure_ascii=False)
-    except Exception:
-        return str(data)
-
-# ---------------------- Export helpers ----------------------
-def export_csv(path: str, contacts: List[Dict[str, Any]]):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Name", "Email", "Phone"])
-        for c in contacts:
-            w.writerow([_fmt_name(c) or "", _fmt_email(c) or "", _fmt_phone(c) or ""])
-    success(f"Saved CSV to {path}")
-
-def export_md(path: str, contacts: List[Dict[str, Any]]):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("| Name | Email | Phone |\n|---|---|---|\n")
-        for c in contacts:
-            f.write(f"| {(_fmt_name(c) or '').replace('|','/')} | {(_fmt_email(c) or '').replace('|','/')} | {(_fmt_phone(c) or '').replace('|','/')} |\n")
-    success(f"Saved Markdown to {path}")
-
+# ---------------------- Export helpers (generic) ----------------------
 def export_json(path: str, payload: dict):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     success(f"Saved JSON to {path}")
 
+def export_csv_table_guess(path: str, payload: dict):
+    """
+    If we can find a list[dict] inside payload, dump it as CSV; else warn.
+    """
+    rows: Optional[List[Dict[str, Any]]] = None
+    headers: List[str] = []
+    for p in payload.get("parts", []):
+        if p.get("type") == "json":
+            data = p.get("json")
+            if isinstance(data, list) and (not data or isinstance(data[0], dict)):
+                rows = data
+                break
+            if isinstance(data, dict):
+                for k in (
+                    "items",
+                    "results",
+                    "data",
+                    "contacts",
+                    "Contacts",
+                    "transactions",
+                    "Transactions",
+                    "invoices_rows",
+                    "totals_by_contact"
+                ):
+                    v = data.get(k)
+                    if isinstance(v, list) and (not v or isinstance(v[0], dict)):
+                        rows = v
+                        break
+        if rows:
+            break
+    if not rows:
+        warn("Could not find a tabular list in the last payload.")
+        return
+    # Collect headers from first few rows
+    for r in rows[:10]:
+        for k in r.keys():
+            if k not in headers:
+                headers.append(k)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in rows:
+            w.writerow([r.get(h, "") for h in headers])
+    success(f"Saved CSV to {path}")
+
+# ---------------------- Parsing & Aggregation (client-side) ----------------------
+def _count_listed_items(payload: dict) -> int:
+    """Count 'Invoice ID:' lines in text blocks. Used to detect page fullness."""
+    if not payload:
+        return 0
+    blocks = [p.get("text", "") for p in payload.get("parts", []) if p.get("type") == "text"]
+    return sum(1 for line in "\n".join(blocks).splitlines() if line.strip().startswith("Invoice ID:"))
+
+def _parse_invoices_from_text(parts: List[dict]) -> List[dict]:
+    """Parse minimal invoice fields from Xero MCP's text output into structured rows."""
+    invoices: List[dict] = []
+    buf: List[str] = []
+
+    def flush():
+        if not buf:
+            return
+        block = "\n".join(buf)
+        row: Dict[str, Any] = {}
+
+        def grab(label: str, pat: str):
+            m = re.search(pat, block)
+            if m:
+                row[label] = m.group(1).strip()
+
+        grab("id", r"Invoice ID:\s*([^\n]+)")
+        grab("type", r"Type:\s*([A-Z]+)")
+        grab("contact", r"Contact:\s*([^(^\n]+)")
+        grab("date_raw", r"Date:\s*([^\n]+)")
+        grab("total_raw", r"Total:\s*([0-9]+(?:\.[0-9]+)?)")
+        grab("currency", r"Currency:\s*([A-Z]{3})")
+
+        if row.get("id"):
+            # Normalize date from strings like: "Wed Jul 19 2017 10:00:00 GMT+1000 (...)"
+            raw = row.get("date_raw", "")
+            try:
+                # take the first 24 chars "Wed Jul 19 2017 10:00:00"
+                short = raw[:24]
+                row["date"] = datetime.strptime(short, "%a %b %d %Y %H:%M:%S").date()
+            except Exception:
+                row["date"] = None
+            try:
+                row["total"] = Decimal(row.get("total_raw", "0"))
+            except Exception:
+                row["total"] = Decimal("0")
+            invoices.append(row)
+        buf.clear()
+
+    for p in parts:
+        if p.get("type") != "text":
+            continue
+        for line in p.get("text", "").splitlines():
+            if line.startswith("Invoice ID:") and buf:
+                flush()
+            buf.append(line)
+    flush()
+    return invoices
+
+def _apply_invoice_filters(
+    invoices: List[dict],
+    filters: Optional[Dict[str, str]]
+) -> Tuple[List[dict], Optional[date], Optional[date], Optional[str]]:
+    """Filter invoices by from/to (dates) and type (ACCREC/ACCPAY)."""
+    if not filters:
+        return invoices, None, None, None
+
+    f = filters or {}
+    from_d = None
+    to_d = None
+    t_filter = f.get("type")
+    try:
+        if f.get("from"):
+            from_d = datetime.strptime(f["from"], "%Y-%m-%d").date()
+    except Exception:
+        from_d = None
+    try:
+        if f.get("to"):
+            to_d = datetime.strptime(f["to"], "%Y-%m-%d").date()
+    except Exception:
+        to_d = None
+
+    out: List[dict] = []
+    for r in invoices:
+        d = r.get("date")
+        ty = r.get("type")
+        if t_filter and ty != t_filter:
+            continue
+        if from_d and (not d or d < from_d):
+            continue
+        if to_d and (not d or d > to_d):
+            continue
+        out.append(r)
+
+    return out, from_d, to_d, t_filter
+
+def _aggregate_invoices_by_contact(invoices: List[dict]) -> List[dict]:
+    """Sum totals by contact; returns list[{'contact','amount'}] sorted desc."""
+    sums: Dict[str, Decimal] = defaultdict(Decimal)
+    for r in invoices:
+        contact = r.get("contact") or "Unknown"
+        sums[contact] += r.get("total", Decimal("0"))
+    rows = [{"contact": k, "amount": float(v)} for k, v in sums.items()]  # float for JSON friendliness
+    rows.sort(key=lambda x: x["amount"], reverse=True)
+    return rows
+
+# ---------------------- Auto-paging wrapper ----------------------
+async def _call_with_auto_paging(session, name: str, args: dict) -> dict:
+    """
+    Auto-pages list-* tools when `_auto_page: true` is provided.
+    For invoices, supports `_summarize: "invoices"` and optional `_filters`.
+    """
+    do_auto = bool(args.pop("_auto_page", False))
+    summarize = args.pop("_summarize", None)
+    filters = args.pop("_filters", None)
+
+    # If not auto-paging or not a list tool, do a single call.
+    if not do_auto or not name.startswith("list-"):
+        mcp_result = await session.call_tool(name=name, arguments=args)
+        return _flatten_mcp_result(mcp_result)
+
+    combined_parts: List[dict] = []
+    page = int(args.get("page", 1))
+    pages_done = 0
+
+    while pages_done < AUTO_PAGE_MAX:
+        cur_args = {**args, "page": page}
+        try:
+            mcp_result = await session.call_tool(name=name, arguments=cur_args)
+            payload = _flatten_mcp_result(mcp_result)
+        except Exception as e:
+            # On error mid-way, stop and return what we have + error
+            combined_parts.append({"type": "json", "json": {"warning": f"Stopped paging due to error on page {page}: {str(e)}"}})
+            break
+
+        parts = payload.get("parts", [])
+        combined_parts.extend(parts)
+
+        # Stop conditions: page returns fewer than typical page size; for invoices we detect via 'Invoice ID:' count
+        item_count = _count_listed_items(payload)
+        if item_count == 0 or item_count < 10:
+            break
+
+        page += 1
+        pages_done += 1
+
+    # Optional summarization for invoices
+    if summarize == "invoices":
+        invoices = _parse_invoices_from_text(combined_parts)
+        filtered, from_d, to_d, t_filter = _apply_invoice_filters(invoices, filters)
+
+        totals = _aggregate_invoices_by_contact(filtered)
+        top = totals[0] if totals else None
+        currency = "AUD"  # Xero demo data usually AUD; adjust if you parse per-invoice
+
+        summary_json = {
+            "kind": "invoices_summary",
+            "currency": currency,
+            "parsed_invoices": len(invoices),
+            "filtered_invoices": len(filtered),
+            "filters_used": {
+                "from": str(from_d) if from_d else None,
+                "to": str(to_d) if to_d else None,
+                "type": t_filter,
+            },
+            # Use 'items' so /export csv works out-of-the-box
+            "items": totals,  # totals_by_contact
+            "top_customer": top,
+        }
+
+        # Also include a small sample of normalized rows to help export/debug
+        sample_rows = [
+            {
+                "id": r.get("id"),
+                "date": str(r.get("date")) if r.get("date") else None,
+                "type": r.get("type"),
+                "contact": r.get("contact"),
+                "total": float(r.get("total", Decimal("0"))),
+                "currency": r.get("currency") or "AUD",
+            }
+            for r in filtered[:500]  # cap
+        ]
+        summary_json["invoices_rows"] = sample_rows
+
+        combined_parts.append({"type": "json", "json": summary_json})
+
+    return {"ok": True, "parts": combined_parts}
+
+# ---------------------- Turn-repair (fix INVALID_ARGUMENT) ----------------------
+def _repair_orphaned_function_calls(history: List[types.Content]) -> None:
+    """
+    If the last turn is an assistant/model turn with function_call parts and the next
+    turn is not a tool response, drop the orphaned call so the API is happy.
+    """
+    if not history:
+        return
+    last = history[-1]
+    role = getattr(last, "role", None)
+    parts = getattr(last, "parts", None)
+    has_func_call = any(getattr(p, "function_call", None) for p in (parts or []))
+    if role in ("assistant", "model") and has_func_call:
+        # No tool response followed → remove the dangling call turn
+        history.pop()
+
 # ---------------------- Chat Session ----------------------
 class ChatState:
     def __init__(self):
-        self.contacts_cache: List[Dict[str, Any]] = []
-        self.contacts_last_payload: Optional[dict] = None
-        self.page = 1
-        self.page_size = DEFAULT_PAGE_SIZE
-        self.filter_text: Optional[str] = None
         self.history_contents: List[types.Content] = []
         self.tool_names: List[str] = []
-        self.list_contacts_tool: Optional[str] = None
-        self.last_page_slice: List[Dict[str, Any]] = []  # slice shown last
+        self.last_tool_payload: Optional[dict] = None  # generic (for /export)
+        self.page_size = DEFAULT_PAGE_SIZE
+        self.show_thinking = SHOW_THINKING
 
     def auto_page_size(self):
         try:
@@ -391,116 +722,122 @@ class ChatState:
         except Exception:
             self.page_size = DEFAULT_PAGE_SIZE
 
-def discover_list_contacts(tools: List[Any]) -> Optional[str]:
-    names = [getattr(t, "name", "") for t in tools]
-    # Heuristics
-    for n in names:
-        ln = n.lower()
-        if "contact" in ln and ("list" in ln or "get" in ln or "find" in ln):
-            return n
-    return None
+    def trim_history(self):
+        # Keep only the most recent MAX_TURNS contents
+        if len(self.history_contents) > MAX_TURNS:
+            self.history_contents = self.history_contents[-MAX_TURNS:]
 
+# ---------------------- Core mediator ----------------------
 async def chat_loop(session: ClientSession):
     client = genai.Client()
     state = ChatState()
     state.auto_page_size()
 
-    # Discover tools up front
+    # Discover tools
     tools_resp = await session.list_tools()
     state.tool_names = [t.name for t in tools_resp.tools]
-    state.list_contacts_tool = discover_list_contacts(tools_resp.tools)
 
-    banner()
+    banner(state.show_thinking)
     info(f"Detected MCP tools: {', '.join(state.tool_names) or '(none found)'}")
-    if state.list_contacts_tool:
-        success(f"Contacts tool detected: [bold]{state.list_contacts_tool}[/bold]" if USE_RICH else f"Contacts tool detected: {state.list_contacts_tool}")
-    tip_quick_actions()
 
-    # Helper to build config each turn (with thinking enabled)
     def build_config() -> types.GenerateContentConfig:
+        tk_cfg = types.ThinkingConfig(
+            include_thoughts=state.show_thinking,
+            thinking_budget=(THINKING_BUDGET if state.show_thinking else 0),
+        )
         return types.GenerateContentConfig(
             system_instruction=SYSTEM,
             temperature=0,
-            tools=[session],  # expose MCP tool declarations to the model
+            tools=[session],
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            thinking_config=types.ThinkingConfig(include_thoughts=True),
+            thinking_config=tk_cfg,
+            # IMPORTANT: Use an allowed MIME type. Markdown can still be sent as plain text.
+            response_mime_type="text/plain",
         )
 
     async def run_tool_call_loop() -> str:
         """
-        Sends state.history_contents to the model, executes any MCP tool calls in sequence,
-        appends function responses, and returns the final text once no more tool calls are requested.
-        Also updates contacts cache when the tool payload contains contacts.
+        Send conversation to the model; if it asks for tool calls, run them with guardrails,
+        return tool outputs, and iterate until a final answer is produced.
         """
+        iterations = 0
         while True:
+            iterations += 1
+            if iterations > MAX_TOOL_ITERATIONS:
+                return "I hit the tool-iteration limit; try refining your request."
+
+            # Ensure no dangling assistant function_call before generation
+            _repair_orphaned_function_calls(state.history_contents)
+
             with spinner("Thinking with Gemini..."):
                 resp = await client.aio.models.generate_content(
                     model=MODEL,
                     contents=state.history_contents,
                     config=build_config(),
                 )
-                
-                # Extract and display thinking if present and enabled
-                if SHOW_THINKING:
-                    thinking_text = extract_thinking(resp)
-                    if thinking_text and thinking_text.strip():
-                        display_thinking(thinking_text)
 
-            # Extract function calls
+            # Optional thinking panel (human-readable summaries only)
+            if state.show_thinking:
+                thinking_text = extract_thinking(resp)
+                if thinking_text:
+                    display_thinking(thinking_text)
+
+            # Collect function calls from first candidate deterministically
             function_calls = []
-            if getattr(resp, "function_calls", None):
+            cand = (resp.candidates or [None])[0]
+            if cand and getattr(resp, "function_calls", None):
                 function_calls = resp.function_calls
-            else:
-                for cand in resp.candidates or []:
-                    if cand and cand.content:
-                        for part in cand.content.parts or []:
-                            if getattr(part, "function_call", None):
-                                function_calls.append(part.function_call)
+            elif cand and cand.content and getattr(cand.content, "parts", None):
+                for part in cand.content.parts or []:
+                    if getattr(part, "function_call", None):
+                        function_calls.append(part.function_call)
 
+            # No tool calls → finalize
             if not function_calls:
-                if resp.candidates and resp.candidates[0].content:
-                    state.history_contents.append(resp.candidates[0].content)
-                # Extract text properly, avoiding the warning about non-text parts
+                if cand and cand.content:
+                    state.history_contents.append(cand.content)
+                state.trim_history()
                 return extract_text_response(resp)
 
-            # Append the model's tool-call content to history
-            if resp.candidates and resp.candidates[0].content:
-                state.history_contents.append(resp.candidates[0].content)
+            # Append assistant tool-call request to history
+            if cand and cand.content:
+                state.history_contents.append(cand.content)
 
+            # Guardrails: run only known tools; ensure args is dict-like
             response_parts: List[types.Part] = []
             for fc in function_calls:
-                name = fc.name
-                args = dict(fc.args or {})
-                with spinner(f"Calling MCP tool: {name}"):
-                    try:
-                        mcp_result = await session.call_tool(name=name, arguments=args)
-                        payload = _flatten_mcp_result(mcp_result)
-                    except Exception as e:
-                        payload = {"ok": False, "error": str(e)}
+                name = getattr(fc, "name", "")
+                args = dict(getattr(fc, "args", {}) or {})
+                if name not in state.tool_names:
+                    payload = {"ok": False, "error": f"Unknown tool '{name}'."}
+                else:
+                    with spinner(f"Calling MCP tool: {name}"):
+                        try:
+                            # Use auto-paging wrapper (supports meta-args)
+                            payload = await _call_with_auto_paging(session, name, args)
+                        except Exception as e:
+                            payload = {"ok": False, "error": str(e)}
 
-                # Cache contacts and render immediately
-                contacts = _extract_contacts(payload)
-                if contacts:
-                    state.contacts_cache = contacts
-                    state.page = 1
-                    slice_, total, s, e = render_contacts_table(
-                        state.contacts_cache, state.page, state.page_size, state.filter_text
-                    )
-                    state.last_page_slice = slice_
-                    info(f"Showing {s}-{e} of {total} contacts.")
+                # Keep last tool payload for optional export/inspection
+                state.last_tool_payload = payload
 
-                state.contacts_last_payload = payload
-                response_parts.append(types.Part(function_response=types.FunctionResponse(name=name, response=payload)))
+                # Show a compact view to the user (generic)
+                render_json_table_if_applicable(payload)
 
-            # Return tool responses to the model as a single tool turn
+                # Return structured tool response back to the model
+                response_parts.append(
+                    types.Part(function_response=types.FunctionResponse(name=name, response=payload))
+                )
+
+            # One consolidated tool turn back to Gemini (MUST be immediately after the call)
             state.history_contents.append(types.Content(role="tool", parts=response_parts))
-            # Loop again (model may call more tools or finalize)
+            state.trim_history()
+            # Loop again (model may chain more calls or finalize)
 
-    # ------------- Input setup (prompt_toolkit if available) -------------
+    # ------------- Input setup -------------
     def build_session():
         completer_words = [
-            "/contacts", "/more", "/page", "/page_size", "/filter", "/clearfilter",
-            "/view", "/copy", "/export", "/thinking", "/help", "/quit"
+            "/tools", "/call", "/export", "/thinking", "/help", "/quit"
         ]
         if USE_PTK:
             completer = WordCompleter(completer_words, ignore_case=True, sentence=True, match_middle=True)
@@ -511,171 +848,95 @@ async def chat_loop(session: ClientSession):
     ptk_session = build_session()
 
     async def get_input() -> str:
-        # Use prompt_toolkit's async API when available
         if USE_PTK and ptk_session:
-            from prompt_toolkit.patch_stdout import patch_stdout
             try:
-                # patch_stdout is a *sync* context manager
                 with patch_stdout():
                     return await ptk_session.prompt_async(
                         PTK_HTML('<b><ansicyan>you</ansicyan></b> ▸ ')
                     )
             except KeyboardInterrupt:
                 return ""
-        # Fallback: don't block the event loop
         try:
             return await asyncio.to_thread(input, "\nYou: ")
         except KeyboardInterrupt:
             return ""
 
-    # ------------- Command handlers -------------
     def show_help():
         cmds = [
-            "/contacts                  list Xero contacts (shortcut to MCP tool)",
-            "/filter <text>             filter cached contacts (name/email)",
-            "/clearfilter               clear filter",
-            "/page N, /more             paging controls",
-            "/page_size N               set items per page",
-            "/view <#>                  show full record (index from current view)",
-            "/copy <#>                  copy email to clipboard",
-            "/export csv|md|json <path> export cached contacts or last payload",
-            "/thinking                  toggle thinking display on/off",
-            "/help                      show this menu",
-            "/quit                      exit",
+            "/tools                        list available MCP tools",
+            "/call <name> <json-args>     call a tool directly, e.g. /call list-bank-transactions {\"pageSize\":10}",
+            "/export json <path>          export last tool payload as JSON",
+            "/export csv <path>           export last tool payload as CSV (best-effort if list[dict])",
+            "/thinking                    toggle thinking on/off (affects generation + budget)",
+            "/help                        show this menu",
+            "/quit                        exit",
         ]
+        body = "\n".join(cmds)
         if USE_RICH:
-            console.print(Panel("\n".join(cmds), title="Commands", box=ROUNDED))
+            console.print(Panel(body, title="Commands", box=ROUNDED))
         else:
             print("\nCommands:\n" + "\n".join("  " + c for c in cmds))
 
-    async def do_contacts():
-        if not state.list_contacts_tool:
-            error("No contacts-capable MCP tool detected.")
+    def list_tools():
+        if not state.tool_names:
+            warn("No tools discovered.")
             return
-        with spinner(f"Calling {state.list_contacts_tool}..."):
+        if USE_RICH:
+            table = Table(box=ROUNDED, show_lines=False, title="Discovered MCP Tools")
+            table.add_column("#", justify="right", style="dim", width=4)
+            table.add_column("Name", style="bold")
+            for i, n in enumerate(state.tool_names, 1):
+                table.add_row(str(i), n)
+            console.print(table)
+        else:
+            print("\nDiscovered MCP Tools:")
+            for i, n in enumerate(state.tool_names, 1):
+                print(f"  {i}. {n}")
+
+    async def call_tool_direct(name: str, args_str: str):
+        if name not in state.tool_names:
+            error(f"Unknown tool: {name}")
+            return
+        try:
+            args = json.loads(args_str) if args_str.strip() else {}
+            if not isinstance(args, dict):
+                raise ValueError("Args must be a JSON object.")
+        except Exception as e:
+            error(f"Invalid JSON args: {e}")
+            return
+        with spinner(f"Calling MCP tool: {name}"):
             try:
-                mcp_result = await session.call_tool(name=state.list_contacts_tool, arguments={})
-                payload = _flatten_mcp_result(mcp_result)
+                payload = await _call_with_auto_paging(session, name, args)
             except Exception as e:
                 error(str(e))
                 return
+        state.last_tool_payload = payload
+        render_json_table_if_applicable(payload)
 
-        contacts = _extract_contacts(payload)
-        state.contacts_last_payload = payload
-        if not contacts:
-            warn("No contacts found in tool response.")
+    def do_export(parts: List[str]):
+        if len(parts) < 2:
+            error("Usage: /export json|csv <path>")
             return
-
-        state.contacts_cache = contacts
-        state.page = 1
-        slice_, total, s, e = render_contacts_table(contacts, state.page, state.page_size, state.filter_text)
-        state.last_page_slice = slice_
-        info(f"Showing {s}-{e} of {total} contacts.")
-
-    def refresh_view():
-        if not state.contacts_cache:
-            warn("No contacts cached. Use /contacts or ask the assistant.")
+        kind = parts[0].lower()
+        path = parts[1]
+        if not state.last_tool_payload:
+            warn("No tool payload available to export.")
             return
-        slice_, total, s, e = render_contacts_table(
-            state.contacts_cache, state.page, state.page_size, state.filter_text
-        )
-        state.last_page_slice = slice_
-        info(f"Showing {s}-{e} of {total} contacts.")
-
-    def view_contact(idx_str: str):
-        try:
-            idx = int(idx_str)
-        except Exception:
-            error("Usage: /view <index-number>")
-            return
-        # Map absolute index to current filtered view
-        if not state.contacts_cache:
-            warn("No contacts cached.")
-            return
-
-        # Recompute current view to fetch correct record
-        items = state.contacts_cache
-        if state.filter_text:
-            pat = re.compile(re.escape(state.filter_text), re.IGNORECASE)
-            def match(c):
-                return ( _fmt_name(c) and pat.search(_fmt_name(c)) ) or ( _fmt_email(c) and pat.search(_fmt_email(c)) )
-            items = [c for c in items if match(c)]
-
-        if idx < 1 or idx > len(items):
-            error("Index out of range.")
-            return
-
-        rec = items[idx - 1]
-        body = pretty_json(rec)
-        if USE_RICH:
-            console.print(Panel(body, title=f"Contact #{idx} — {_fmt_name(rec)}", box=ROUNDED))
-        else:
-            print(f"\nContact #{idx} — {_fmt_name(rec)}\n{body}")
-
-    def copy_email(idx_str: str):
-        if not USE_CLIP:
-            warn("pyperclip not installed. `pip install pyperclip` to enable copy.")
-            return
-        try:
-            idx = int(idx_str)
-        except Exception:
-            error("Usage: /copy <index-number>")
-            return
-        # Recompute current view
-        items = state.contacts_cache
-        if state.filter_text:
-            pat = re.compile(re.escape(state.filter_text), re.IGNORECASE)
-            def match(c):
-                return ( _fmt_name(c) and pat.search(_fmt_name(c)) ) or ( _fmt_email(c) and pat.search(_fmt_email(c)) )
-            items = [c for c in items if match(c)]
-        if idx < 1 or idx > len(items):
-            error("Index out of range.")
-            return
-        email_val = _fmt_email(items[idx - 1]) or ""
-        if not email_val:
-            warn("No email on that record.")
-            return
-        pyperclip.copy(email_val)
-        success(f"Copied: {email_val}")
-
-    def do_export(args: List[str]):
-        if not args:
-            error("Usage: /export csv|md|json <path>")
-            return
-        kind = args[0].lower()
-        path = args[1] if len(args) > 1 else None
-
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        if kind == "csv":
-            if not state.contacts_cache:
-                warn("No contacts cached.")
-                return
-            path = path or f"contacts-{ts}.csv"
-            if not path.lower().endswith(".csv"):
-                path += ".csv"
-            export_csv(path, state.contacts_cache)
-        elif kind == "md":
-            if not state.contacts_cache:
-                warn("No contacts cached.")
-                return
-            path = path or f"contacts-{ts}.md"
-            if not path.lower().endswith(".md"):
-                path += ".md"
-            export_md(path, state.contacts_cache)
-        elif kind == "json":
-            if not state.contacts_last_payload:
-                warn("No tool payload cached yet.")
-                return
-            path = path or f"payload-{ts}.json"
+        if kind == "json":
             if not path.lower().endswith(".json"):
                 path += ".json"
-            export_json(path, state.contacts_last_payload)
+            export_json(path, state.last_tool_payload)
+        elif kind == "csv":
+            if not path.lower().endswith(".csv"):
+                path += ".csv"
+            export_csv_table_guess(path, state.last_tool_payload)
         else:
-            error("Unknown export type. Use csv|md|json.")
+            error("Unknown export type. Use json|csv.")
 
     # ---------------- Main loop ----------------
     while True:
-        user = (await get_input()).strip()
+        user = (await get_input()) or ""
+        user = user.strip()
         if not user:
             continue
 
@@ -688,86 +949,68 @@ async def chat_loop(session: ClientSession):
         if low in ("/help", "help"):
             show_help()
             continue
-        if low == "/more":
-            if not state.contacts_cache:
-                warn("No contacts cached.")
-            else:
-                state.page += 1
-                refresh_view()
+        if low.startswith("/tools"):
+            list_tools()
             continue
-        if low.startswith("/page "):
+        if low.startswith("/call "):
+            # /call <name> <json-args>
             try:
-                p = int(user.split(None, 1)[1])
-                if p < 1:
-                    raise ValueError
-                state.page = p
-                refresh_view()
-            except Exception:
-                error("Usage: /page <positive-integer>")
-            continue
-        if low.startswith("/page_size "):
-            try:
-                n = int(user.split(None, 1)[1])
-                if n < MIN_PAGE_SIZE:
-                    n = MIN_PAGE_SIZE
-                state.page_size = n
-                refresh_view()
-            except Exception:
-                error(f"Usage: /page_size <integer ≥ {MIN_PAGE_SIZE}>")
-            continue
-        if low == "/contacts":
-            await do_contacts()
-            continue
-        if low.startswith("/filter "):
-            state.filter_text = user.split(None, 1)[1].strip()
-            state.page = 1
-            refresh_view()
-            continue
-        if low == "/clearfilter":
-            state.filter_text = None
-            refresh_view()
-            continue
-        if low.startswith("/view "):
-            view_contact(user.split(None, 1)[1].strip())
-            continue
-        if low.startswith("/copy "):
-            copy_email(user.split(None, 1)[1].strip())
+                _, rest = user.split(None, 1)
+                name, args_str = (rest.split(None, 1) + [""])[:2]
+                await call_tool_direct(name, args_str)
+            except ValueError:
+                error("Usage: /call <tool-name> <json-args>")
             continue
         if low.startswith("/export"):
             parts = user.split()
             do_export(parts[1:])
             continue
         if low == "/thinking":
-            global SHOW_THINKING
-            SHOW_THINKING = not SHOW_THINKING
-            status = "enabled" if SHOW_THINKING else "disabled"
-            success(f"Thinking display {status}")
+            state.show_thinking = not state.show_thinking
+            status = "enabled" if state.show_thinking else "disabled"
+            success(f"Thinking {status} (budget={THINKING_BUDGET if state.show_thinking else 0})")
+            banner(state.show_thinking)
             continue
 
         # Otherwise: forward to the model (natural language)
-        # Add this user message to conversation history
         state.history_contents.append(types.UserContent(parts=[types.Part(text=user)]))
+        state.trim_history()
 
-        # Manual tool-call loop until final answer
         final_text = await run_tool_call_loop()
         if final_text and final_text.strip():
             if USE_RICH:
                 console.print(Panel(final_text, title="Assistant", box=ROUNDED, style=Style(color="white")))
             else:
                 print(f"\nAssistant: {final_text}")
+        else:
+            warn("No user-visible text returned (model sent only tool calls or thoughts). Try /thinking off and ask again.")
 
 # ---------------------- Entrypoint ----------------------
 async def main():
     if not shutil.which("npx"):
         raise RuntimeError("npx is not installed. Install Node.js (includes npx).")
 
+    # You can override the MCP server via env if desired
+    mcp_command = os.environ.get("MCP_COMMAND", "npx")
+    mcp_args_env = os.environ.get("MCP_ARGS_JSON", "")
+    if mcp_args_env:
+        try:
+            args_list = json.loads(mcp_args_env)
+            if not isinstance(args_list, list):
+                raise ValueError
+            mcp_args = args_list
+        except Exception:
+            raise RuntimeError("MCP_ARGS_JSON must be a JSON array of args.")
+    else:
+        # Default to Xero MCP server
+        mcp_args = ["-y", "@xeroapi/xero-mcp-server@latest"]
+
     server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "@xeroapi/xero-mcp-server@latest"],
+        command=mcp_command,
+        args=mcp_args,
         env={
             "XERO_CLIENT_ID": os.environ.get("XERO_CLIENT_ID", ""),
             "XERO_CLIENT_SECRET": os.environ.get("XERO_CLIENT_SECRET", ""),
-            "XERO_CLIENT_BEARER_TOKEN": os.environ.get("XERO_CLIENT_BEARER_TOKEN", ""),
         },
     )
 
@@ -775,7 +1018,7 @@ async def main():
         read, write = await stack.enter_async_context(stdio_client(server_params))
         async with ClientSession(read, write) as session:
             await session.initialize()
-            # Header in plain text for environments without rich
+            # Header for non-rich envs
             print(f"Connected to Xero MCP at {datetime.now().isoformat(timespec='seconds')}")
             print(f"Model: {MODEL}  |  SDK: google-genai")
             await chat_loop(session)
