@@ -46,11 +46,25 @@ except Exception:
 
 # ---------------- Config ----------------
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+SHOW_THINKING = os.environ.get("SHOW_THINKING", "true").lower() in ("true", "1", "yes")
 SYSTEM = (
-    "You are a helpful assistant with access to Xero via MCP tools. "
-    "When the user asks for Xero data/actions, choose the appropriate tool. "
-    "If listing contacts, call the list-contacts tool without asking for confirmation "
-    "and summarize the first page. Be concise but clear."
+    "You are a specialized Xero financial data assistant with access to Xero via MCP tools. "
+    "You excel at analyzing Balance Sheets and Profit & Loss statements, providing clear financial insights. "
+    
+    "When working with financial data:\n"
+    "- For Balance Sheet requests: Focus on assets, liabilities, and equity positions\n"
+    "- For P&L requests: Analyze revenue, expenses, and profitability trends\n"
+    "- Always highlight key financial metrics and ratios when relevant\n"
+    "- Identify significant changes or anomalies in financial data\n"
+    "- Present data in a structured, easy-to-understand format\n"
+    "- When showing multi-period data, calculate and highlight period-over-period changes\n"
+    
+    "For any Xero data requests:\n"
+    "- Choose the most appropriate MCP tool for the task\n"
+    "- Summarize key findings from the data\n"
+    "- Be concise but comprehensive in your analysis\n"
+    "- Always provide context for financial figures (e.g., currency, time periods)\n"
+    "- Suggest follow-up questions or related analyses when appropriate"
 )
 
 APP_NAME = "Xero Assistant"
@@ -128,16 +142,81 @@ def _fmt_phone(c: Dict[str, Any]):
             return _get_str(p0, "PhoneNumber", "phoneNumber", "number") or ""
     return ""
 
+# ---------------------- Thinking helpers ----------------------
+def extract_thinking(response) -> Optional[str]:
+    """Return the human-readable thought summary text (not the signature)."""
+    if not getattr(response, "candidates", None):
+        return None
+
+    pieces: List[str] = []
+    for cand in response.candidates or []:
+        content = getattr(cand, "content", None)
+        if not content or not getattr(content, "parts", None):
+            continue
+        for part in content.parts or []:
+            # Only show text parts explicitly marked as thoughts
+            if getattr(part, "thought", False) and getattr(part, "text", None):
+                pieces.append(part.text)
+
+    return "\n".join(pieces).strip() if pieces else None
+
+
+def display_thinking(thinking_text: str):
+    """Display the thinking process in a visually distinct way."""
+    if not thinking_text or not thinking_text.strip():
+        return
+    
+    # Don't display if it's just "True" or similar boolean values
+    if thinking_text.strip().lower() in ('true', 'false', '1', '0'):
+        return
+        
+    if USE_RICH:
+        # Create a subtle, collapsible-style display for thinking
+        thinking_panel = Panel(
+            thinking_text.strip(),
+            title="Thinking Process...",
+            title_align="left",
+            box=ROUNDED,
+            style="dim",
+            border_style="dim blue",
+            padding=(0, 1)
+        )
+        console.print(thinking_panel)
+    else:
+        # Simple text display for non-rich environments
+        print("\n🤔 Thinking Process:")
+        print("-" * 40)
+        # Indent the thinking text slightly
+        for line in thinking_text.strip().split('\n'):
+            print(f"  {line}")
+        print("-" * 40)
+
+def extract_text_response(response) -> str:
+    """Return only the normal answer text (exclude thought summaries/signatures)."""
+    if not getattr(response, "candidates", None):
+        return ""
+    out: List[str] = []
+    for cand in response.candidates or []:
+        content = getattr(cand, "content", None)
+        if not content or not getattr(content, "parts", None):
+            continue
+        for part in content.parts or []:
+            # Keep non-thought text only; ignore thought text and any signatures
+            if getattr(part, "text", None) and not getattr(part, "thought", False):
+                out.append(part.text)
+    return "".join(out)
+
 # ---------------------- UX helpers ----------------------
 def banner():
+    thinking_status = "ON" if SHOW_THINKING else "OFF"
     if USE_RICH:
         title = Text(APP_NAME, style="bold cyan")
-        subtitle = Text(f"Connected to Xero MCP · Model: {MODEL} · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        subtitle = Text(f"Connected to Xero MCP · Model: {MODEL} · Thinking: {thinking_status} · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                         style="dim")
         console.print(Panel(Align.center(Text.assemble(title, "\n", subtitle)), box=ROUNDED))
     else:
         print(f"{APP_NAME} — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"Model: {MODEL}")
+        print(f"Model: {MODEL} · Thinking: {thinking_status}")
         print("-" * 60)
 
 def tip_quick_actions():
@@ -148,6 +227,7 @@ def tip_quick_actions():
         "[bold]/copy 7[/bold] copy email of item 7",
         "[bold]/export csv contacts.csv[/bold]  or  [bold]/export md out.md[/bold]  or  [bold]/export json out.json[/bold]",
         "[bold]/page 2[/bold] · [bold]/more[/bold] · [bold]/page_size 30[/bold]",
+        "[bold]/thinking[/bold] toggle AI thinking display",
         "[bold]/help[/bold] to see all commands",
     ]
     if USE_RICH:
@@ -336,13 +416,14 @@ async def chat_loop(session: ClientSession):
         success(f"Contacts tool detected: [bold]{state.list_contacts_tool}[/bold]" if USE_RICH else f"Contacts tool detected: {state.list_contacts_tool}")
     tip_quick_actions()
 
-    # Helper to build config each turn (no thinking_config; dynamic by default)
+    # Helper to build config each turn (with thinking enabled)
     def build_config() -> types.GenerateContentConfig:
         return types.GenerateContentConfig(
             system_instruction=SYSTEM,
-            temperature=0,  # deterministic for planning/tool selection
+            temperature=0,
             tools=[session],  # expose MCP tool declarations to the model
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            thinking_config=types.ThinkingConfig(include_thoughts=True),
         )
 
     async def run_tool_call_loop() -> str:
@@ -358,6 +439,12 @@ async def chat_loop(session: ClientSession):
                     contents=state.history_contents,
                     config=build_config(),
                 )
+                
+                # Extract and display thinking if present and enabled
+                if SHOW_THINKING:
+                    thinking_text = extract_thinking(resp)
+                    if thinking_text and thinking_text.strip():
+                        display_thinking(thinking_text)
 
             # Extract function calls
             function_calls = []
@@ -373,7 +460,8 @@ async def chat_loop(session: ClientSession):
             if not function_calls:
                 if resp.candidates and resp.candidates[0].content:
                     state.history_contents.append(resp.candidates[0].content)
-                return resp.text or ""
+                # Extract text properly, avoiding the warning about non-text parts
+                return extract_text_response(resp)
 
             # Append the model's tool-call content to history
             if resp.candidates and resp.candidates[0].content:
@@ -402,7 +490,7 @@ async def chat_loop(session: ClientSession):
                     info(f"Showing {s}-{e} of {total} contacts.")
 
                 state.contacts_last_payload = payload
-                response_parts.append(types.Part.from_function_response(name=name, response=payload))
+                response_parts.append(types.Part(function_response=types.FunctionResponse(name=name, response=payload)))
 
             # Return tool responses to the model as a single tool turn
             state.history_contents.append(types.Content(role="tool", parts=response_parts))
@@ -412,7 +500,7 @@ async def chat_loop(session: ClientSession):
     def build_session():
         completer_words = [
             "/contacts", "/more", "/page", "/page_size", "/filter", "/clearfilter",
-            "/view", "/copy", "/export", "/help", "/quit"
+            "/view", "/copy", "/export", "/thinking", "/help", "/quit"
         ]
         if USE_PTK:
             completer = WordCompleter(completer_words, ignore_case=True, sentence=True, match_middle=True)
@@ -451,6 +539,7 @@ async def chat_loop(session: ClientSession):
             "/view <#>                  show full record (index from current view)",
             "/copy <#>                  copy email to clipboard",
             "/export csv|md|json <path> export cached contacts or last payload",
+            "/thinking                  toggle thinking display on/off",
             "/help                      show this menu",
             "/quit                      exit",
         ]
@@ -648,14 +737,20 @@ async def chat_loop(session: ClientSession):
             parts = user.split()
             do_export(parts[1:])
             continue
+        if low == "/thinking":
+            global SHOW_THINKING
+            SHOW_THINKING = not SHOW_THINKING
+            status = "enabled" if SHOW_THINKING else "disabled"
+            success(f"Thinking display {status}")
+            continue
 
         # Otherwise: forward to the model (natural language)
         # Add this user message to conversation history
-        state.history_contents.append(types.UserContent(parts=[types.Part.from_text(text=user)]))
+        state.history_contents.append(types.UserContent(parts=[types.Part(text=user)]))
 
         # Manual tool-call loop until final answer
         final_text = await run_tool_call_loop()
-        if final_text:
+        if final_text and final_text.strip():
             if USE_RICH:
                 console.print(Panel(final_text, title="Assistant", box=ROUNDED, style=Style(color="white")))
             else:
