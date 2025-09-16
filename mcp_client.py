@@ -4,11 +4,15 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import AsyncExitStack
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 import re
 import csv
 from collections import defaultdict
 from decimal import Decimal
+from pathlib import Path
+import sys
+
+import requests
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -16,6 +20,66 @@ from mcp.client.stdio import stdio_client
 # Google GenAI SDK
 from google import genai
 from google.genai import types
+
+# ------------ Load environment variables from .env file ------------
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file, won't override existing env vars
+
+# ------------ Database connectivity for client selection ------------
+try:
+    import psycopg
+    from contextlib import contextmanager
+    
+    def get_database_url() -> str:
+        """Get database URL from environment"""
+        raw = os.getenv("DATABASE_URL", "")
+        if not raw:
+            return ""
+        return raw.strip().strip('"').strip("'")
+    
+    @contextmanager
+    def get_db_conn():
+        """Get database connection"""
+        url = get_database_url()
+        if not url:
+            raise RuntimeError("DATABASE_URL is not set")
+        with psycopg.connect(url, autocommit=True) as conn:
+            yield conn
+    
+    def list_available_clients() -> List[Tuple[int, str, str, str]]:
+        """List all available Xero clients from database"""
+        try:
+            with get_db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, tenant_id, tenant_name, expires_at, updated_at
+                        FROM xero_users 
+                        ORDER BY updated_at DESC
+                    """)
+                    return cur.fetchall()
+        except Exception as e:
+            print(f"[WARN] Failed to fetch clients from database: {e}")
+            return []
+    
+    def get_client_by_id(client_id: int) -> Optional[Tuple[int, str, str, str, str, str]]:
+        """Get client details by ID"""
+        try:
+            with get_db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, tenant_id, tenant_name, access_token, refresh_token, expires_at 
+                        FROM xero_users 
+                        WHERE id = %s
+                    """, (client_id,))
+                    return cur.fetchone()
+        except Exception as e:
+            print(f"[WARN] Failed to fetch client {client_id}: {e}")
+            return None
+    
+    DATABASE_AVAILABLE = True
+except ImportError:
+    print("[WARN] psycopg not available - client selection disabled")
+    DATABASE_AVAILABLE = False
 
 # ------------ Optional UX libs (graceful fallback) ------------
 USE_RICH = True
@@ -43,6 +107,13 @@ except Exception:
 # ---------------- Config ----------------
 APP_NAME = "Xero Assistant"
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+TOKEN_SERVICE_URL = os.environ.get("XERO_TOKEN_SERVICE_URL", "").strip()
+TOKEN_SERVICE_API_KEY = os.environ.get("XERO_TOKEN_SERVICE_API_KEY", "").strip()
+PREFERRED_TENANT_ID = os.environ.get("XERO_TENANT_ID", "").strip()
+try:
+    TOKEN_SERVICE_TIMEOUT = int(os.environ.get("XERO_TOKEN_SERVICE_TIMEOUT", "15"))
+except ValueError:
+    TOKEN_SERVICE_TIMEOUT = 15
 SYSTEM = r"""
 # Xero Financial Copilot — System Instruction (v2)
 
@@ -328,38 +399,43 @@ def banner(thinking_on: bool):
     if USE_RICH:
         title = Text(APP_NAME, style="bold cyan")
         subtitle = Text(
-            f"Connected to Xero MCP · Model: {MODEL} · Thinking: {thinking_status} · {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"Connected to Xero MCP | Model: {MODEL} | Thinking: {thinking_status} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             style="dim",
         )
         console.print(Panel(Align.center(Text.assemble(title, "\n", subtitle)), box=ROUNDED))
     else:
-        print(f"{APP_NAME} — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"Model: {MODEL} · Thinking: {thinking_status}")
-        print("-" * 60)
+        print(f"{APP_NAME} | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(f"Model: {MODEL} | Thinking: {thinking_status}")
+        print('-' * 60)
+
 
 def info(msg: str):
     if USE_RICH:
-        console.print(f"[cyan]ℹ[/cyan] {msg}")
+        console.print(f"[cyan]INFO[/cyan] {msg}")
     else:
-        print("[i]", msg)
+        print("[INFO]", msg)
+
 
 def success(msg: str):
     if USE_RICH:
-        console.print(f"[green]✔[/green] {msg}")
+        console.print(f"[green]OK[/green] {msg}")
     else:
-        print("[✓]", msg)
+        print("[OK]", msg)
+
 
 def warn(msg: str):
     if USE_RICH:
-        console.print(f"[yellow]⚠[/yellow] {msg}")
+        console.print(f"[yellow]WARN[/yellow] {msg}")
     else:
-        print("[!]", msg)
+        print("[WARN]", msg)
+
 
 def error(msg: str):
     if USE_RICH:
-        console.print(f"[red]✖[/red] {msg}")
+        console.print(f"[red]ERROR[/red] {msg}")
     else:
-        print("[x]", msg)
+        print("[ERROR]", msg)
+
 
 def spinner(msg: str):
     class Dummy:
@@ -369,6 +445,215 @@ def spinner(msg: str):
         def __exit__(self, exc_type, exc, tb):
             pass
     return console.status(msg) if USE_RICH else Dummy()
+
+
+# ---------------------- Client Selection UI ----------------------
+def select_xero_client() -> Optional[int]:
+    """
+    Display available Xero clients and prompt user to select one.
+    Returns the selected client ID or None if cancelled/failed.
+    """
+    if not DATABASE_AVAILABLE:
+        warn("Database connection not available. Using fallback token method.")
+        return None
+    
+    # Fetch available clients
+    clients = list_available_clients()
+    if not clients:
+        warn("No Xero clients found in database. Please complete OAuth flow first:")
+        warn("1. Start server: python server/app.py")
+        warn("2. Visit: http://localhost:8000")
+        warn("3. Click 'Connect to Xero' and complete authorization")
+        return None
+    
+    # Display client selection
+    if USE_RICH:
+        console.print("\n[bold cyan]🔗 Available Xero Organizations[/bold cyan]")
+        
+        table = Table(box=ROUNDED, show_lines=False)
+        table.add_column("ID", justify="right", style="bold green", width=4)
+        table.add_column("Organization", style="bold")
+        table.add_column("Tenant ID", style="dim")
+        table.add_column("Last Updated", style="dim")
+        table.add_column("Expires", style="yellow")
+        
+        for client in clients:
+            client_id, tenant_id, tenant_name, expires_at, updated_at = client
+            # Format dates
+            try:
+                if isinstance(expires_at, str):
+                    exp_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+                    exp_str = exp_dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    exp_str = str(expires_at)[:16] if expires_at else "Unknown"
+                
+                if isinstance(updated_at, str):
+                    upd_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                    upd_str = upd_dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    upd_str = str(updated_at)[:16] if updated_at else "Unknown"
+            except Exception:
+                exp_str = str(expires_at)[:16] if expires_at else "Unknown"
+                upd_str = str(updated_at)[:16] if updated_at else "Unknown"
+            
+            table.add_row(
+                str(client_id),
+                tenant_name or "Unknown Organization",
+                tenant_id[:12] + "..." if tenant_id and len(tenant_id) > 15 else tenant_id or "",
+                upd_str,
+                exp_str
+            )
+        
+        console.print(table)
+    else:
+        print("\n🔗 Available Xero Organizations:")
+        print("=" * 60)
+        for client in clients:
+            client_id, tenant_id, tenant_name, expires_at, updated_at = client
+            print(f"ID: {client_id}")
+            print(f"  Organization: {tenant_name or 'Unknown Organization'}")
+            print(f"  Tenant ID: {tenant_id}")
+            print(f"  Last Updated: {updated_at}")
+            print(f"  Expires: {expires_at}")
+            print("-" * 40)
+    
+    # Prompt for selection (async-compatible)
+    while True:
+        try:
+            # Use simple input to avoid asyncio event loop conflicts
+            user_input = input("\n🎯 Enter Client ID (or 'q' to quit): ").strip()
+            
+            if user_input.lower() in ('q', 'quit', 'exit'):
+                return None
+            
+            client_id = int(user_input)
+            
+            # Validate selection
+            valid_ids = [c[0] for c in clients]
+            if client_id in valid_ids:
+                return client_id
+            else:
+                error(f"Invalid client ID. Choose from: {', '.join(map(str, valid_ids))}")
+        
+        except ValueError:
+            error("Please enter a valid numeric client ID")
+        except (KeyboardInterrupt, EOFError):
+            print("\n")
+            return None
+
+
+def setup_dynamic_token(client_id: int) -> bool:
+    """
+    Fetch client details from database and set up dynamic bearer token.
+    Returns True if successful, False otherwise.
+    """
+    if not DATABASE_AVAILABLE:
+        return False
+    
+    # Fetch client details
+    client_data = get_client_by_id(client_id)
+    if not client_data:
+        error(f"Client ID {client_id} not found in database")
+        return False
+    
+    client_id_db, tenant_id, tenant_name, access_token, refresh_token, expires_at = client_data
+    
+    # Check token expiration
+    try:
+        if isinstance(expires_at, str):
+            exp_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+        else:
+            exp_dt = expires_at
+        
+        now = datetime.now(timezone.utc)
+        if exp_dt <= now:
+            warn(f"Token for {tenant_name} has expired ({exp_dt}). May need refresh.")
+            # We'll continue anyway as the system can attempt refresh
+    except Exception:
+        warn("Could not parse token expiration date")
+    
+    # Set environment variables dynamically
+    os.environ['XERO_CLIENT_BEARER_TOKEN'] = access_token
+    os.environ['XERO_TENANT_ID'] = tenant_id
+    
+    # Display success
+    if USE_RICH:
+        console.print(Panel(
+            f"✅ [green]Connected to:[/green] {tenant_name}\n"
+            f"🏢 [dim]Tenant ID:[/dim] {tenant_id}\n"
+            f"🔑 [dim]Token:[/dim] {access_token[:12]}...\n"
+            f"⏰ [dim]Expires:[/dim] {expires_at}",
+            title="🚀 Dynamic Token Setup",
+            box=ROUNDED,
+            style="green"
+        ))
+    else:
+        success(f"Connected to: {tenant_name}")
+        print(f"  Tenant ID: {tenant_id}")
+        print(f"  Token: {access_token[:12]}...")
+        print(f"  Expires: {expires_at}")
+    
+    return True
+
+
+
+class TokenServiceError(Exception):
+    """Raised when fetching a Xero access token from the SaaS backend fails."""
+
+
+def _parse_iso8601(ts: str | None) -> Optional[datetime]:
+    if not ts:
+        return None
+    value = ts.strip()
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def fetch_token_from_service(base_url: str, api_key: str, tenant_id: str | None) -> Dict[str, Any]:
+    if not base_url:
+        raise TokenServiceError('Token service URL is not configured.')
+    url = base_url.rstrip('/') + '/api/xero/token'
+    headers = {'Accept': 'application/json'}
+    if api_key:
+        headers['X-Api-Key'] = api_key
+    params: Dict[str, str] = {}
+    if tenant_id:
+        params['tenantId'] = tenant_id
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=TOKEN_SERVICE_TIMEOUT)
+    except requests.RequestException as exc:
+        raise TokenServiceError(f'Request failed: {exc}') from exc
+    if resp.status_code != 200:
+        snippet = resp.text.strip()
+        if len(snippet) > 200:
+            snippet = snippet[:200] + '...'
+        raise TokenServiceError(f"{resp.status_code} {snippet}")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise TokenServiceError('Token service returned invalid JSON.') from exc
+    if not isinstance(data, dict):
+        raise TokenServiceError('Unexpected token service response type.')
+    if not data.get('access_token'):
+        raise TokenServiceError('Token service response is missing access_token.')
+    return data
+
+
+def ensure_bearer_token_from_service() -> Optional[Dict[str, Any]]:
+    if os.environ.get('XERO_CLIENT_BEARER_TOKEN'):
+        return None
+    if not TOKEN_SERVICE_URL:
+        return None
+    payload = fetch_token_from_service(TOKEN_SERVICE_URL, TOKEN_SERVICE_API_KEY, PREFERRED_TENANT_ID or None)
+    os.environ['XERO_CLIENT_BEARER_TOKEN'] = payload['access_token']
+    tenant = payload.get('tenant_id') or payload.get('tenantId')
+    if tenant and not os.environ.get('XERO_TENANT_ID'):
+        os.environ['XERO_TENANT_ID'] = tenant
+    return payload
 
 def render_json_table_if_applicable(payload: dict):
     """
@@ -990,6 +1275,57 @@ async def main():
     if not shutil.which("npx"):
         raise RuntimeError("npx is not installed. Install Node.js (includes npx).")
 
+    # ======== NEW: Dynamic Client Selection Flow ========
+    # Skip hardcoded .env tokens and prompt user for client selection
+    
+    # Clear any existing hardcoded bearer token to force dynamic selection
+    if 'XERO_CLIENT_BEARER_TOKEN' in os.environ:
+        info("Clearing hardcoded XERO_CLIENT_BEARER_TOKEN to enable dynamic client selection")
+        del os.environ['XERO_CLIENT_BEARER_TOKEN']
+    
+    # Step 1: Try client selection from database (NEW PRIMARY METHOD)
+    bearer_token_set = False
+    if DATABASE_AVAILABLE:
+        try:
+            selected_client_id = select_xero_client()
+            if selected_client_id:
+                bearer_token_set = setup_dynamic_token(selected_client_id)
+                if bearer_token_set:
+                    info("✅ Using dynamic token from database client selection")
+        except Exception as e:
+            warn(f"Client selection failed: {e}")
+    
+    # Step 2: Fallback to token service (EXISTING METHOD)
+    if not bearer_token_set:
+        info("Falling back to token service method...")
+        token_payload: Optional[Dict[str, Any]] = None
+        try:
+            token_payload = ensure_bearer_token_from_service()
+        except TokenServiceError as exc:
+            if os.environ.get('XERO_CLIENT_ID'):
+                warn(f"Token service fetch failed ({exc}); falling back to client credentials.")
+            else:
+                raise RuntimeError(f"Failed to fetch Xero access token: {exc}") from exc
+
+        if token_payload:
+            tenant = token_payload.get('tenant_id') or token_payload.get('tenantId') or '(unknown tenant)'
+            expires = _parse_iso8601(token_payload.get('expires_at'))
+            info(f"Using bearer token from token service for tenant {tenant}.")
+            if expires:
+                remaining = max(0, int((expires - datetime.now(timezone.utc)).total_seconds() // 60))
+                info(f"Token expires at {expires.isoformat()} (~{remaining} min remaining).")
+            else:
+                warn('Token service did not return a parseable expires_at; continuing anyway.')
+            bearer_token_set = True
+
+    # Step 3: Final validation
+    if not os.environ.get('XERO_CLIENT_BEARER_TOKEN') and not os.environ.get('XERO_CLIENT_ID'):
+        warn('Neither XERO_CLIENT_BEARER_TOKEN nor XERO_CLIENT_ID is set; the MCP server may fail to authenticate.')
+        if DATABASE_AVAILABLE:
+            warn('Suggestion: Ensure you have completed OAuth flow and have clients in database.')
+        else:
+            warn('Suggestion: Set up database connection or configure XERO_CLIENT_ID/SECRET in .env')
+
     # You can override the MCP server via env if desired
     mcp_command = os.environ.get("MCP_COMMAND", "npx")
     mcp_args_env = os.environ.get("MCP_ARGS_JSON", "")
@@ -1011,6 +1347,8 @@ async def main():
         env={
             "XERO_CLIENT_ID": os.environ.get("XERO_CLIENT_ID", ""),
             "XERO_CLIENT_SECRET": os.environ.get("XERO_CLIENT_SECRET", ""),
+            "XERO_CLIENT_BEARER_TOKEN": os.environ.get("XERO_CLIENT_BEARER_TOKEN", ""),
+            "XERO_TENANT_ID": os.environ.get("XERO_TENANT_ID", ""),
         },
     )
 
@@ -1025,3 +1363,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
