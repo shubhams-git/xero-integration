@@ -6,28 +6,28 @@ A comprehensive system for integrating with Xero accounting software using Model
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Client    │────▶│  OAuth Flow  │────▶│   NeonDB     │
+│   Client    │────▶│  OAuth Flow  │───▶│   NeonDB     │
 │  Browser    │     │ (server/app) │     │  (Postgres)  │
 └─────────────┘     └──────────────┘     └──────────────┘
                             │                      │
                             ▼                      ▼
                     ┌──────────────┐     ┌──────────────┐
                     │ Xero OAuth   │     │ Token Store  │
-                    │   Service     │     │   & Refresh  │
+                    │   Service    │     │   & Refresh  │
                     └──────────────┘     └──────────────┘
                                                    │
-                    ┌──────────────────────────────┤
-                    ▼                              ▼
+                    ┌──────────────────────────────
+                    ▼                            
             ┌──────────────┐              ┌──────────────┐
             │ mcp_client.py│              │Xero MCP      │
-            │   (Chat UI)  │◀────────────▶│   Server     │
+            │   (Chat UI)  │◀───────────▶│   Server     │
             └──────────────┘              └──────────────┘
-                    │                              │
-                    ▼                              ▼
-            ┌──────────────┐              ┌──────────────┐
-            │  Gemini AI   │              │  Xero API    │
-            │  (2.5 Pro)   │              │              │
-            └──────────────┘              └──────────────┘
+                    │                              
+                    ▼                              
+            ┌──────────────┐
+            │  Gemini AI   │
+            │  (2.5 Flash) │              
+            └──────────────┘              
 ```
 
 ## Components
