@@ -4,7 +4,7 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import AsyncExitStack
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 import re
 import csv
 from collections import defaultdict
@@ -16,7 +16,7 @@ import requests
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from xero_token_refresh import refresh_expired_tokens, refresh_token_for_client
+from xero_token_refresh import refresh_expired_tokens, refresh_token_for_client, check_token_status, RefreshResult
 # Google GenAI SDK
 from google import genai
 from google.genai import types
@@ -447,8 +447,17 @@ def select_xero_client() -> Optional[int]:
     if not valid_clients and expired_clients:
         info("Attempting automatic token refresh for expired Xero orgs...")
         try:
-            refreshed = refresh_expired_tokens(grace_seconds=300)
-            if refreshed:
+            refreshed_count, refresh_results = refresh_expired_tokens(grace_seconds=300, verbose=False)
+            
+            # Show results for each refresh attempt
+            for result in refresh_results:
+                if result.success:
+                    success(f"Refreshed {result.tenant_name or result.client_id}")
+                else:
+                    warn(f"Failed to refresh {result.tenant_name or result.client_id}: {result.error_message}")
+            
+            if refreshed_count > 0:
+                info(f"Successfully refreshed {refreshed_count} token(s). Re-checking client status...")
                 clients = _query_clients()
                 valid_clients, expired_clients = [], []
                 now = datetime.now(timezone.utc)
@@ -565,16 +574,28 @@ def setup_dynamic_token(client_id: int) -> bool:
         exp_dt = None
 
     now = datetime.now(timezone.utc)
-    if not exp_dt or exp_dt <= now:
-        info(f"Token for {tenant_name} is expired or invalid. Attempting refresh...")
-        ok = False
+    
+    # Check if token is expired or expiring soon (within 5 minutes)
+    is_expired = not exp_dt or exp_dt <= now
+    expires_soon = exp_dt and exp_dt <= (now + timedelta(minutes=5)) if exp_dt else True
+    
+    if is_expired or expires_soon:
+        if is_expired:
+            info(f"Token for {tenant_name} is expired. Attempting refresh...")
+        else:
+            info(f"Token for {tenant_name} expires soon (within 5 minutes). Proactively refreshing...")
         try:
-            ok = refresh_token_for_client(client_id_db)
+            refresh_result = refresh_token_for_client(client_id_db, verbose=False)
+            if not refresh_result.success:
+                error(f"Token refresh failed: {refresh_result.error_message}")
+                error("Please re-authorize via server/app.py → Connect to Xero.")
+                return False
+            else:
+                success(f"Token refreshed successfully. New expiry: {refresh_result.new_expiry}")
         except Exception as e:
-            warn(f"Refresh attempt failed: {e}")
-        if not ok:
-            error("Token refresh failed. Please re-authorize via server/app.py → Connect to Xero.")
+            error(f"Refresh attempt failed: {e}")
             return False
+        
         # Re-fetch fresh values
         client_data = get_client_by_id(client_id)
         if not client_data:
