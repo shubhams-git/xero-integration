@@ -16,7 +16,7 @@ import requests
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
+from xero_token_refresh import refresh_expired_tokens, refresh_token_for_client
 # Google GenAI SDK
 from google import genai
 from google.genai import types
@@ -108,176 +108,178 @@ except Exception:
 APP_NAME = "Xero Assistant"
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 TOKEN_SERVICE_URL = os.environ.get("XERO_TOKEN_SERVICE_URL", "").strip()
-TOKEN_SERVICE_API_KEY = os.environ.get("XERO_TOKEN_SERVICE_API_KEY", "").strip()
 PREFERRED_TENANT_ID = os.environ.get("XERO_TENANT_ID", "").strip()
 try:
     TOKEN_SERVICE_TIMEOUT = int(os.environ.get("XERO_TOKEN_SERVICE_TIMEOUT", "15"))
 except ValueError:
     TOKEN_SERVICE_TIMEOUT = 15
-SYSTEM = r"""
-# Xero Financial Copilot — System Instruction (v2)
+def get_system_prompt() -> str:
+    current_datetime = datetime.now().strftime("%A, %B %d, %Y at %H:%M:%S %Z")
+    return f"""
+# Xero SME Copilot — System Instruction
+You are a senior business analyst + Xero copilot for **SME clients**. Your job is to **do the work**, not just explain it: plan briefly, call MCP tools, and return decision-ready answers.
 
-You are a senior financial analyst + Xero copilot that **executes tasks** via MCP tools and returns decision-ready answers. Favor **doing** over caveats. If the exact report doesn’t exist, orchestrate an **alternative plan** using available tools (list endpoints + client-side aggregation). Ask **once** only if a task is heavy (see “Asking Policy”), then execute.
+**CURRENT DATE AND TIME: {current_datetime}**
+Use this exact current date and time for all date-related calculations and refe/qui rences. Do not guess or hallucinate dates.
 
----
+You run on **Gemini 2.5 (Flash/Pro)**. Use a **step-by-step internal plan**, call the right tools, and synthesize concise outputs. If the exact artifact doesn't exist, compose it from multiple endpoints and client-side aggregation.
 
-## 0) Safety & redaction (always)
-- **Never** surface credentials or raw headers. If a tool payload mentions `Authorization`, tokens, cookies, or account numbers, **redact** to last 4 chars before showing anything to the user.
-- If a tool returns a verbose error blob, summarize it (status, message) and provide the concrete fix; do not paste raw tokens/IDs.
+Reference the Xero MCP tool catalog: @https://github.com/XeroAPI/xero-mcp-server/tree/main/src/tools/list
+Research the latest Xero MCP tools and how best to use them for each user query so you can fetch the freshest data before acting.
+To understand how the Xero Accounting API works (reports, profit and loss, balance sheet etc.), refer to: @https://developer.xero.com/documentation/api/accounting/reports
+For the Xero MCP server repository and docs, see: @https://github.com/XeroAPI/xero-mcp-server/
+If the user query is complex, think harder and apply your best planning and analytical skills before responding.
 
----
+────────────────────────────────────────────────────────────────────────
 
-## 1) Defaults & date normalization (no back-and-forth)
-Resolve vague timeframes **without asking**:
-- “this month” → first to last day of the current calendar month.
-- “this year” → Jan 1 to Dec 31 of the current calendar year. If asked for YTD, use Jan 1 → today.
-- “last month” → previous calendar month.
-- “last 12 months (LTM)” → rolling 12 complete months ending last month.
+## 0) Safety & redaction
+- Never surface credentials or raw headers. Redact secrets to last 4 chars.
+- Summarize error blobs (status + actionable fix). Don’t paste tokens/IDs.
+
+## 1) Who is asking? (light persona model → priorities → tone)
+- **Owner/Founder:** cash runway, collections, taxes due, sales pipeline conversion. Wants “what now?” actions.
+- **Bookkeeper/Accountant:** AR/AP hygiene, reconciliations, journals, GST/BAS periods, contact/item data quality.
+- **Ops/Project lead:** job/region tracking, timesheets/approvals, leave availability, quote→invoice flow, delivery blockers.
+- **CFO/Controller:** P&L by month, BS snapshot, variances, margin by item/region, AR aging & top debtors/creditors.
+
+Respond in the **shortest actionable form** for these roles (see Output Contract).
+
+## 2) Date & defaults (no back-and-forth)
+- “this month” = first→last day of current month; “this year” = Jan 1→Dec 31; “LTM” = last 12 complete months ending last month.
 - Quarters: Q1=Jan–Mar; Q2=Apr–Jun; Q3=Jul–Sep; Q4=Oct–Dec.
-- If the user later corrects dates, re-run with their exact range.
+- Page size 20 (newest first). Currency: show codes (AUD, NZD). Money: 2 decimals with thousands separators.
+- Always list the exact filters used under **Assumptions & Filters**.
 
-Other defaults:
-- Page size 20; newest first.
-- Currency: show **currency codes** (AUD, NZD, etc.).
-- Rounding: 2 decimals for money, thousands separators; show totals.
+## 3) Planning & execution
+- **Plan first (internally):** 3–6 bullet steps: which tool(s), which filters, how to aggregate.
+- Prefer **fresh data** via MCP over guessing. After each tool run: **synthesize**, don't dump.
+- If completion needs **>20 tool calls or >10 auto-pages**, **ask once** for approval with the estimated call/page count (then proceed).
 
-State the defaults you used under **Assumptions & Filters**.
+## 4) Intent → tool routing (covering all detected tools)
+**Organisation & setup**
+- org info → `list-organisation-details`
+- accounts/taxes/contact-groups/tracking → `list-accounts`, `list-tax-rates`, `list-contact-groups`, `list-tracking-categories`
 
----
+**Contacts & items**
+- lookup/update → `list-contacts`, `update-contact`
+- create contact → `create-contact`
+- items (list/create/update) → `list-items`, `create-item`, `update-item`
 
-## 2) Input normalization → tool routing
-Map user phrasing to the most specific tool:
+**Sales / AR (quotes, invoices, payments, credit notes)**
+- quotes (list/create/update) → `list-quotes`, `create-quote`, `update-quote`
+- invoices (list/create/update) → `list-invoices`, `create-invoice`, `update-invoice`
+- payments (list/create) → `list-payments`, `create-payment`
+- credit notes (list/create/update) → `list-credit-notes`, `create-credit-note`, `update-credit-note`
+- workflow examples:
+  - “convert quote to invoice” → fetch quote → `create-invoice` from quote lines → (optional) `create-payment`
+  - “write off” small residuals → `create-credit-note` + allocate
 
-- “org details”, “organisation info” → **list-organisation-details**
-- “profit and loss”, “P&L” → **list-profit-and-loss**
-- “balance sheet” → **list-report-balance-sheet** (needs as-of date; use period end)
-- “trial balance” → **list-trial-balance**
-- “bank transactions” → **list-bank-transactions** (support date/account filters)
-- “invoices / quotes / credit notes / payments” → **list-*** with appropriate filters
-- “aged AR/AP by contact” → **list-aged-receivables-by-contact** / **list-aged-payables-by-contact**
-- “contacts/items/accounts/taxes” → **list-contacts**, **list-items**, **list-accounts**, **list-tax-rates**
-- Payroll/timesheets/tracking → the matching list/update tools; be explicit about period/scope.
+**Purchases / AP**
+- vendor bills & payments via `list-invoices` with `type=ACCPAY`, `list-payments`, and credit notes tooling as above.
 
-If a user asks to “create/update” an object, route to the corresponding **create-*** or **update-*** tool with minimal required fields and sensible defaults, then confirm what was changed.
+**Banking & cash**
+- bank txns (list/create/update) → `list-bank-transactions`, `create-bank-transaction`, `update-bank-transaction`
+- proxy cash-flow (see Recipe 4.3)
 
----
+**Journals**
+- manual journals (list/create/update) → `list-manual-journals`, `create-manual-journal`, `update-manual-journal`
 
-## 3) Pagination & client-side aggregation (use meta-args our client understands)
-When the task implies “all”, a summary, or big ranges, request client help:
+**Timesheets & payroll leave**
+- timesheets (list/get/create/approve/revert/delete/line ops) → 
+  `list-timesheets`, `get-timesheet`, `create-timesheet`, `approve-timesheet`, `revert-timesheet`, `delete-timesheet`, `add-timesheet-line`, `update-timesheet-line`
+- payroll employees & leave →
+  `list-payroll-employees`, `list-payroll-leave-types`, `list-payroll-employee-leave-types`, `list-payroll-employee-leave-balances`, `list-payroll-employee-leave`, `list-payroll-leave-periods`
 
-- `_auto_page: true` → fetch to the end (bounded by a safety cap).
-- `_summarize: "invoices"` → client parses and aggregates invoice totals (e.g., by contact/date/type).
-- `_filters: {from:"YYYY-MM-DD", to:"YYYY-MM-DD", type:"ACCREC|ACCPAY"}` → client applies post-fetch filters.
+**Reports & analysis**
+- P&L → `list-profit-and-loss`
+- Balance Sheet → `list-report-balance-sheet`
+- Trial Balance → `list-trial-balance`
+- Aged AR/AP → `list-aged-receivables-by-contact`, `list-aged-payables-by-contact`
 
-Prefer the most specific list endpoint and let the client auto-page + aggregate.
+**Tracking & dimensionality**
+- tracking categories/options (list/create/update) → 
+  `list-tracking-categories`, `create-tracking-category`, `update-tracking-category`, 
+  `create-tracking-options`, `update-tracking-options`
 
----
+## 5) High-intent SME asks → immediate patterns (don't ask first)
+- **"Cash this month / last month / this week"** → `list-bank-transactions` [date range]; compute **inflow**, **outflow**, **net**, top counterparties, largest 5.
+- **"Who owes us the most / top debtors 90d"** → `list-invoices` with `_auto_page:true`, `_summarize:"invoices"`, `_filters:{{from,to,type:"ACCREC"}}`; aggregate outstanding by contact.
+- **"Top expenses / where I spent the most / biggest spending"** → `list-invoices` with `_auto_page:true`, `_summarize:"invoices"`, `_filters:{{from,to,type:"ACCPAY"}}`; aggregate by contact for vendor spending analysis.
+- **"Overdue now"** → invoices where `status` overdue and `dueDate < today`.
+- **"Profit each month this year"** → monthly P&L (see Recipe 4.1).
+- **"Balance sheet as of YYYY-MM-DD"** → point BS (see Recipe 4.2).
+- **"Quote→Invoice and send payment link"** → pull quote → create invoice → (optional) create payment or surface balance + due.
+- **"Leave liability / who's available next 2 weeks"** → payroll leave types/balances + periods; summarize by employee.
+- **"Timesheets to approve"** → `list-timesheets` with status filter → `approve-timesheet` or `revert-timesheet` as instructed.
 
-## 4) Report recipes (do, don’t ask)
+## 6) Pagination & client-side aggregation
+- For “all/summary/big ranges,” request:
+  - `_auto_page:true` (safety cap applies)
+  - `_summarize:"invoices"` where supported
+  - `_filters:{{from,to,type,...}}` for light client-side filters
+- Stop early if you already reached a stable headline number.
 
-### 4.1 Profit & Loss — monthly view for a year
-Issue with Xero API: `periods` must be **1–11** in some modes. Do **not** ask the user about this. Use one of these tactics automatically:
+## 7) Report recipes (do; don’t ask)
+**4.1 P&L – monthly view for a year**  
+Try `list-profit-and-loss` with `fromDate=YYYY-01-01`, `toDate=YYYY-12-31`, `timeframe=MONTH`.  
+If API enforces `periods 1–11`: run 2 calls (Jan–Nov with `periods=11`, Dec with `periods=1`) or loop 12 months; merge client-side.  
+Return table: Month, Revenue, COGS, Gross Profit, Opex, Net Profit; totals and MoM deltas.
 
-**Preferred:** Call **list-profit-and-loss** with `fromDate`=`YYYY-01-01`, `toDate`=`YYYY-12-31`, `timeframe=MONTH` **without** `periods`, if the tool supports it.
+**4.2 Balance Sheet snapshot**  
+`list-report-balance-sheet` with `asOfDate`. If a range is given, show end-of-period and change vs start.
 
-**Fallback (when periods is enforced 1–11):**
-- Run 2 calls:
-  - Call A: `fromDate=YYYY-01-01`, `toDate=YYYY-11-30`, `timeframe=MONTH`, `periods=11`
-  - Call B: `fromDate=YYYY-12-01`, `toDate=YYYY-12-31`, `timeframe=MONTH`, `periods=1`
-- Combine the 12 months client-side and present a single table.
+**4.3 Cash movement (proxy cash-flow)**  
+`list-bank-transactions` in range. Compute inflow/outflow/net, top counterparties, and largest 5 transactions.
 
-**If the tool exposes only a single month:** loop months Jan→Dec (≤12 calls, allowed by Asking Policy), aggregate client-side.
+**4.4 Invoices KPIs**  
+`list-invoices` with `_auto_page:true` + `_summarize:"invoices"` → top customers, overdue totals, collections by day/contact.
 
-Always present: Revenue, COGS, Gross Profit, Opex, Net Profit per month; include totals and (if applicable) YoY or MoM deltas.
+**4.5 Aged AR/AP**  
+Direct aged reports by contact; optionally scope to a named contact and return bucketed totals (0-30, 31-60, 61-90, 90+).
 
-### 4.2 Balance Sheet
-- Use **list-report-balance-sheet** with `asOfDate` = requested end date; if a range is given, show **end-of-period** snapshot and (optionally) compare with start.
+**4.6 Tracking splits**  
+Pass tracking filters where supported; otherwise fetch and group client-side by category/option.
 
-### 4.3 Cash movement from bank transactions (proxy cash-flow)
-- Use **list-bank-transactions** with date range; compute **inflow**, **outflow**, **net cash**, top counterparties, and largest 5 transactions.
-- Support filters: account, type (RECEIVE/SPEND), and tracking (if exposed).
+## 8) Creation/update workflows (be specific; validate minimum fields)
+- **Invoices/Quotes/Payments/Credit notes/Manual journals/Contacts/Items/Bank transactions**
+  - Validate required fields; infer safe defaults (today’s date, due terms from org or 30d if absent, currency).
+  - Echo a **concise change log**: what was created/updated, total(s), status, and key IDs (partially masked if sensitive).
+- **Timesheets**
+  - When approving or reverting, confirm counts and date spans.
+  - Deleting is destructive—state the object and date span before executing.
 
-### 4.4 Invoices KPIs
-- Use **list-invoices** with `_auto_page: true` and `_summarize: "invoices"`.
-- Common asks:
-  - “overdue now” → filter by status + dueDate < today.
-  - “top debtors last 90 days” → filter date range + type=ACCREC; show top contacts by outstanding.
-  - “collections this month” → filter payments or invoices with status PAID, group by day/contact.
+## 9) Error-recovery playbooks
+- **Period rules clash (P&L)** → switch to two-call or monthly loop.
+- **Rate-limit** → retry once with smaller scope; otherwise state the limit and suggest narrowing.
+- **Auth/scope** → say what’s missing (scope) and ask to re-auth.
+- **Empty data** → say so plainly; suggest concrete next step (wider range/different status/other org).
 
-### 4.5 Aged AR/AP by contact
-- Use **list-aged-receivables-by-contact** / **list-aged-payables-by-contact**, optionally scoped to a named contact.
+## 10) Output Contract (always)
+**CRITICAL:** After calling any tools, you MUST provide a complete user-facing response.
 
-### 4.6 Tracking categories
-- If user asks “by region/class/project”, pass tracking filters where the tool supports them; otherwise fetch and **group client-side**.
+1) **Direct answer:** one headline paragraph.  
+2) **Key metrics:** bullets with numbers.  
+3) **Details:** compact table or concise bullets (top rows/aggregates).  
+4) **Assumptions & Filters:** exact dates, statuses, currency, defaults, redactions.  
+5) **Next steps:** 1–2 precise follow-ups ("drill into July variance by contact?").
 
----
+Keep text minimal; prefer aggregates over raw dumps. **Never leave the user without a clear, actionable response.**
 
-## 5) Asking Policy (minimize friction)
-- Proceed **without asking** if the plan needs **≤12 tool calls** or **≤10 auto-pages**.
-- If more than that, ask **once**: “This will run ~N calls/pages; OK to proceed?”
-- On **rate-limit** or **auth** errors, retry once with smaller scope; otherwise return the 1-line diagnosis + fix.
+## 11) Ask-once policy
+Proceed without asking if the plan needs **≤20 tool calls** or **≤10 auto-pages**.  
+If heavier, ask once (“~N calls/pages; proceed?”), then execute.
 
----
-
-## 6) Error-recovery playbooks (examples)
-- **P&L 400: “periods 1–11”** → Switch to the **two-call** or **per-month loop** strategy and proceed.
-- **From/To + Periods conflict** → Remove `periods` and rely on `fromDate`/`toDate` + `timeframe`.
-- **Scope/auth** → Ask the user to re-auth or add scope (state the missing scope).
-- **Empty data** → Say it plainly and suggest the next concrete step (expand range, different status, include other orgs).
-
----
-
-## 7) Output Contract (always visible text)
-Structure every answer:
-
-1) **Direct answer** — 1 short paragraph with the headline result.
-2) **Key metrics** — bullets with numbers.
-3) **Details** — compact table or concise bullets (top rows/aggregates). For monthly P&L, show Month, Revenue, COGS, GP, Opex, Net.
-4) **Assumptions & Filters** — exact dates, statuses, currency, defaults used, and any redactions applied.
-5) **Next steps** — 1–2 precise follow-ups or actions (e.g., “drill into July variance by contact?”).
-
-Use absolute dates (YYYY-MM-DD). Prefer aggregates to raw dumps.
-
----
-
-## 8) Examples (follow these patterns)
-
-- **“How much profit did we make each month this year?”**
-  - Resolve “this year” → current calendar year (Jan 1–Dec 31).
-  - Try P&L with timeframe=MONTH (no periods). If rejected, run 2-call or 12-call fallback. Present 12-row table.
-
-- **“Show cash received and paid last month, and top 5 vendors.”**
-  - list-bank-transactions with last month, compute inflow/outflow/net, group vendors; show top 5.
-
-- **“Which customers owe us the most in the last 90 days?”**
-  - list-invoices with `_auto_page: true`, `_summarize: "invoices"`, `_filters` last 90 days, type=ACCREC; show top contacts with outstanding.
-
-- **“Balance sheet as of 2025-06-30?”**
-  - list-report-balance-sheet with asOf=2025-06-30; show assets/liabilities/equity totals and key ratios.
-
----
-
-## 9) Final reminders
-- Think briefly, then act; chain only when needed.
-- Prefer the most specific tool; let the client auto-page and summarize when available.
-- If something truly cannot be done, propose the closest viable alternative and ask **once** if heavy; then execute.
-- Return **only** user-visible text (plain or markdown). Never include raw headers, tokens, or giant payloads.
+## 12) Final reminders
+- Think briefly, then act. Route to the **most specific tool**, aggregate client-side when needed.
+- If something cannot be done, propose the closest viable alternative and the *exact* tool sequence you'll run next.
+- **ALWAYS provide a user-visible response** after tool calls. Summarize findings, present key insights, and answer the user's question clearly.
+- Return only user-visible text (plain/markdown). No raw headers/tokens or giant payloads.
 
 """
-
-
-# Thinking toggle actually controls generation + budget
-# Default OFF for cleaner UX; toggle with /thinking
-SHOW_THINKING = os.environ.get("SHOW_THINKING", "false").lower() in ("true", "1", "yes")
-THINKING_BUDGET = int(os.environ.get("THINKING_BUDGET", "-1"))  # -1 dynamic, 0 off, >0 fixed tokens
 
 # History/windowing
 HISTORY_PATH = os.path.expanduser("~/.xero_mcp_history")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "24"))  # rough bound on conversation length
-
-# Tool-call loop guardrails
-MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "6"))
-
 # Auto-paging safety
 AUTO_PAGE_MAX = int(os.environ.get("AUTO_PAGE_MAX", "15"))  # cap pages when _auto_page is on
 
@@ -297,7 +299,7 @@ def pretty_json(data: Any) -> str:
 def truncate_str(s: str, limit: int = 2000) -> str:
     if len(s) <= limit:
         return s
-    return s[:limit] + f"\n… [truncated {len(s)-limit} chars]"
+    return s[:limit] + f"\n... [truncated {len(s)-limit} chars]"
 
 def sizeof_json(obj: Any) -> int:
     try:
@@ -306,6 +308,16 @@ def sizeof_json(obj: Any) -> int:
         return 0
 
 # ---------------------- MCP result normalization ----------------------
+def mask_secret(value: Optional[str], visible: int = 4) -> str:
+    """Return a masked representation of a secret value."""
+    if not value:
+        return ""
+    trimmed = value.strip()
+    if len(trimmed) <= visible:
+        return "*" * len(trimmed)
+    masked_len = max(0, len(trimmed) - visible)
+    return "*" * masked_len + trimmed[-visible:]
+
 def _flatten_mcp_result(result) -> dict:
     """
     Normalize MCP tool result into a simple payload:
@@ -325,50 +337,9 @@ def _flatten_mcp_result(result) -> dict:
         payload["message"] = msg
     return payload
 
-# ---------------------- Thinking helpers ----------------------
-def extract_thinking(response) -> Optional[str]:
-    """
-    Return human-readable thought summaries only.
-    We show only parts where part.thought == True and part.text exists.
-    """
-    if not getattr(response, "candidates", None):
-        return None
-    pieces: List[str] = []
-    for cand in response.candidates or []:
-        content = getattr(cand, "content", None)
-        if not content or not getattr(content, "parts", None):
-            continue
-        for part in content.parts or []:
-            if getattr(part, "thought", False) and getattr(part, "text", None):
-                pieces.append(part.text)
-    txt = "\n".join(pieces).strip() if pieces else None
-    return txt or None
-
-def display_thinking(thinking_text: str):
-    if not thinking_text or not thinking_text.strip():
-        return
-    if USE_RICH:
-        thinking_panel = Panel(
-            truncate_str(thinking_text.strip(), 4000),
-            title="Thinking Process",
-            title_align="left",
-            box=ROUNDED,
-            style="dim",
-            border_style="dim blue",
-            padding=(0, 1),
-        )
-        console.print(thinking_panel)
-    else:
-        print("\n🤔 Thinking Process:")
-        print("-" * 40)
-        for line in thinking_text.strip().split("\n"):
-            print(f"  {line}")
-        print("-" * 40)
-
 def extract_text_response(response) -> str:
     """
-    Collect user-visible text. If empty (sometimes happens when include_thoughts=True),
-    fall back to the first thought text so the UI never stays blank.
+    Collect user-visible text from the model response.
     """
     if not getattr(response, "candidates", None):
         return ""
@@ -378,34 +349,25 @@ def extract_text_response(response) -> str:
     if not cand or not getattr(cand, "content", None) or not getattr(cand.content, "parts", None):
         return ""
 
-    # 1) Prefer non-thought text
+    # Collect all text parts
     for part in cand.content.parts or []:
-        if getattr(part, "text", None) and not getattr(part, "thought", False):
+        if getattr(part, "text", None):
             out.append(part.text)
 
-    if out:
-        return "".join(out)
-
-    # 2) Fallback: if nothing user-visible, pick the first thought text (when thinking is enabled)
-    for part in cand.content.parts or []:
-        if getattr(part, "thought", False) and getattr(part, "text", None):
-            return part.text
-
-    return ""
+    return "".join(out)
 
 # ---------------------- UI helpers ----------------------
-def banner(thinking_on: bool):
-    thinking_status = "ON" if thinking_on else "OFF"
+def banner():
     if USE_RICH:
         title = Text(APP_NAME, style="bold cyan")
         subtitle = Text(
-            f"Connected to Xero MCP | Model: {MODEL} | Thinking: {thinking_status} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"Connected to Xero MCP | Model: {MODEL} | {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             style="dim",
         )
         console.print(Panel(Align.center(Text.assemble(title, "\n", subtitle)), box=ROUNDED))
     else:
         print(f"{APP_NAME} | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        print(f"Model: {MODEL} | Thinking: {thinking_status}")
+        print(f"Model: {MODEL}")
         print('-' * 60)
 
 
@@ -449,92 +411,134 @@ def spinner(msg: str):
 
 # ---------------------- Client Selection UI ----------------------
 def select_xero_client() -> Optional[int]:
-    """
-    Display available Xero clients and prompt user to select one.
-    Returns the selected client ID or None if cancelled/failed.
+    """Display available Xero clients and prompt the user to pick one.
+    If none are valid, try to refresh expired ones automatically.
     """
     if not DATABASE_AVAILABLE:
-        warn("Database connection not available. Using fallback token method.")
+        error("Database connection not available. Cannot proceed without database connection.")
         return None
-    
-    # Fetch available clients
-    clients = list_available_clients()
+
+    def _query_clients():
+        return list_available_clients() or []
+
+    clients = _query_clients()
     if not clients:
-        warn("No Xero clients found in database. Please complete OAuth flow first:")
-        warn("1. Start server: python server/app.py")
-        warn("2. Visit: http://localhost:8000")
-        warn("3. Click 'Connect to Xero' and complete authorization")
+        error("No Xero clients found in database. Please complete OAuth flow first:")
+        error("1. Start server: python server/app.py")
+        error("2. Visit: http://localhost:8000")
+        error("3. Click 'Connect to Xero' and complete authorization")
         return None
-    
-    # Display client selection
+
+    # Partition valid vs expired
+    valid_clients, expired_clients = [], []
+    now = datetime.now(timezone.utc)
+    for client in clients:
+        client_id, tenant_id, tenant_name, expires_at, updated_at = client
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at).replace('Z', '+00:00')) if expires_at else None
+        except Exception:
+            exp_dt = None
+        if not exp_dt or exp_dt <= now:
+            expired_clients.append(client)
+        else:
+            valid_clients.append(client)
+
+    # If no valid clients, attempt automatic refresh and re-query once
+    if not valid_clients and expired_clients:
+        info("Attempting automatic token refresh for expired Xero orgs...")
+        try:
+            refreshed = refresh_expired_tokens(grace_seconds=300)
+            if refreshed:
+                clients = _query_clients()
+                valid_clients, expired_clients = [], []
+                now = datetime.now(timezone.utc)
+                for client in clients:
+                    client_id, tenant_id, tenant_name, expires_at, updated_at = client
+                    try:
+                        exp_dt = datetime.fromisoformat(str(expires_at).replace('Z', '+00:00')) if expires_at else None
+                    except Exception:
+                        exp_dt = None
+                    if not exp_dt or exp_dt <= now:
+                        expired_clients.append(client)
+                    else:
+                        valid_clients.append(client)
+        except Exception as e:
+            warn(f"Auto-refresh attempt failed: {e}")
+
+    # UI render as before (unchanged) ...
     if USE_RICH:
-        console.print("\n[bold cyan]🔗 Available Xero Organizations[/bold cyan]")
-        
-        table = Table(box=ROUNDED, show_lines=False)
-        table.add_column("ID", justify="right", style="bold green", width=4)
-        table.add_column("Organization", style="bold")
-        table.add_column("Tenant ID", style="dim")
-        table.add_column("Last Updated", style="dim")
-        table.add_column("Expires", style="yellow")
-        
-        for client in clients:
-            client_id, tenant_id, tenant_name, expires_at, updated_at = client
-            # Format dates
-            try:
-                if isinstance(expires_at, str):
-                    exp_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-                    exp_str = exp_dt.strftime("%Y-%m-%d %H:%M")
-                else:
+        console.print("\n[bold cyan]Available Xero Organizations[/bold cyan]")
+        if valid_clients:
+            table = Table(box=ROUNDED, show_lines=False)
+            table.add_column("ID", justify="right", style="bold green", width=4)
+            table.add_column("Organization", style="bold")
+            table.add_column("Tenant ID", style="dim")
+            table.add_column("Last Updated", style="dim")
+            table.add_column("Expires", style="green")
+            for client in valid_clients:
+                client_id, tenant_id, tenant_name, expires_at, updated_at = client
+                try:
+                    exp_dt = datetime.fromisoformat(str(expires_at).replace('Z', '+00:00')) if expires_at else None
+                    upd_dt = datetime.fromisoformat(str(updated_at).replace('Z', '+00:00')) if updated_at else None
+                    exp_str = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "Unknown"
+                    upd_str = upd_dt.strftime("%Y-%m-%d %H:%M") if upd_dt else "Unknown"
+                except Exception:
                     exp_str = str(expires_at)[:16] if expires_at else "Unknown"
-                
-                if isinstance(updated_at, str):
-                    upd_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                    upd_str = upd_dt.strftime("%Y-%m-%d %H:%M")
-                else:
                     upd_str = str(updated_at)[:16] if updated_at else "Unknown"
-            except Exception:
-                exp_str = str(expires_at)[:16] if expires_at else "Unknown"
-                upd_str = str(updated_at)[:16] if updated_at else "Unknown"
-            
-            table.add_row(
-                str(client_id),
-                tenant_name or "Unknown Organization",
-                tenant_id[:12] + "..." if tenant_id and len(tenant_id) > 15 else tenant_id or "",
-                upd_str,
-                exp_str
-            )
-        
-        console.print(table)
+                table.add_row(
+                    str(client_id),
+                    tenant_name or "Unknown Organization",
+                    tenant_id[:12] + "..." if tenant_id and len(tenant_id) > 15 else tenant_id or "",
+                    upd_str,
+                    exp_str,
+                )
+            console.print(table)
+        if expired_clients:
+            console.print("\n[bold red]Expired/Invalid Tokens:[/bold red]")
+            expired_table = Table(box=ROUNDED, show_lines=False)
+            expired_table.add_column("ID", justify="right", style="dim", width=4)
+            expired_table.add_column("Organization", style="dim")
+            expired_table.add_column("Status", style="red")
+            for client in expired_clients:
+                client_id, tenant_id, tenant_name, expires_at, updated_at = client
+                expired_table.add_row(str(client_id), tenant_name or "Unknown Organization", "EXPIRED")
+            console.print(expired_table)
     else:
-        print("\n🔗 Available Xero Organizations:")
+        print("\nAvailable Xero Organizations:")
         print("=" * 60)
-        for client in clients:
+        for client in valid_clients:
             client_id, tenant_id, tenant_name, expires_at, updated_at = client
             print(f"ID: {client_id}")
             print(f"  Organization: {tenant_name or 'Unknown Organization'}")
-            print(f"  Tenant ID: {tenant_id}")
-            print(f"  Last Updated: {updated_at}")
-            print(f"  Expires: {expires_at}")
+            print(f"  Status: VALID")
             print("-" * 40)
-    
-    # Prompt for selection (async-compatible)
+        if expired_clients:
+            print("\nExpired/Invalid Tokens:")
+            for client in expired_clients:
+                client_id, tenant_id, tenant_name, expires_at, updated_at = client
+                print(f"ID: {client_id}")
+                print(f"  Organization: {tenant_name or 'Unknown Organization'}")
+                print(f"  Status: EXPIRED")
+                print("-" * 40)
+
+    if not valid_clients:
+        error("No valid Xero tokens found. All tokens are expired or invalid.")
+        error("If auto-refresh didn’t work, your refresh tokens may be invalid/expired. Re-authorize:")
+        error("1. Run: python server/app.py")
+        error("2. Visit: http://localhost:8000")
+        error("3. Click 'Connect to Xero' and complete authorization")
+        return None
+
+    valid_ids = [c[0] for c in valid_clients]
     while True:
         try:
-            # Use simple input to avoid asyncio event loop conflicts
-            user_input = input("\n🎯 Enter Client ID (or 'q' to quit): ").strip()
-            
+            user_input = input("\nEnter Client ID (or 'q' to quit): ").strip()
             if user_input.lower() in ('q', 'quit', 'exit'):
                 return None
-            
             client_id = int(user_input)
-            
-            # Validate selection
-            valid_ids = [c[0] for c in clients]
             if client_id in valid_ids:
                 return client_id
-            else:
-                error(f"Invalid client ID. Choose from: {', '.join(map(str, valid_ids))}")
-        
+            error(f"Invalid client ID. Choose from valid IDs: {', '.join(map(str, valid_ids))}")
         except ValueError:
             error("Please enter a valid numeric client ID")
         except (KeyboardInterrupt, EOFError):
@@ -543,58 +547,63 @@ def select_xero_client() -> Optional[int]:
 
 
 def setup_dynamic_token(client_id: int) -> bool:
-    """
-    Fetch client details from database and set up dynamic bearer token.
-    Returns True if successful, False otherwise.
-    """
+    """Fetch client from DB; if token expired, try refresh; then set env vars."""
     if not DATABASE_AVAILABLE:
         return False
-    
-    # Fetch client details
+
     client_data = get_client_by_id(client_id)
     if not client_data:
         error(f"Client ID {client_id} not found in database")
         return False
-    
+
     client_id_db, tenant_id, tenant_name, access_token, refresh_token, expires_at = client_data
-    
-    # Check token expiration
+
+    # Parse expiry
     try:
-        if isinstance(expires_at, str):
-            exp_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-        else:
-            exp_dt = expires_at
-        
-        now = datetime.now(timezone.utc)
-        if exp_dt <= now:
-            warn(f"Token for {tenant_name} has expired ({exp_dt}). May need refresh.")
-            # We'll continue anyway as the system can attempt refresh
+        exp_dt = datetime.fromisoformat(str(expires_at).replace('Z', '+00:00')) if expires_at else None
     except Exception:
-        warn("Could not parse token expiration date")
-    
-    # Set environment variables dynamically
+        exp_dt = None
+
+    now = datetime.now(timezone.utc)
+    if not exp_dt or exp_dt <= now:
+        info(f"Token for {tenant_name} is expired or invalid. Attempting refresh...")
+        ok = False
+        try:
+            ok = refresh_token_for_client(client_id_db)
+        except Exception as e:
+            warn(f"Refresh attempt failed: {e}")
+        if not ok:
+            error("Token refresh failed. Please re-authorize via server/app.py → Connect to Xero.")
+            return False
+        # Re-fetch fresh values
+        client_data = get_client_by_id(client_id)
+        if not client_data:
+            error("Post-refresh, client row not found.")
+            return False
+        client_id_db, tenant_id, tenant_name, access_token, refresh_token, expires_at = client_data
+
+    # Set env for MCP server
     os.environ['XERO_CLIENT_BEARER_TOKEN'] = access_token
     os.environ['XERO_TENANT_ID'] = tenant_id
-    
-    # Display success
+
+    token_preview = ("*" * (len(access_token) - 4) + access_token[-4:]) if access_token else ""
     if USE_RICH:
         console.print(Panel(
-            f"✅ [green]Connected to:[/green] {tenant_name}\n"
-            f"🏢 [dim]Tenant ID:[/dim] {tenant_id}\n"
-            f"🔑 [dim]Token:[/dim] {access_token[:12]}...\n"
-            f"⏰ [dim]Expires:[/dim] {expires_at}",
-            title="🚀 Dynamic Token Setup",
+            f"[green]Connected to:[/green] {tenant_name}\n"
+            f"[dim]Tenant ID:[/dim] {tenant_id}\n"
+            f"[dim]Token:[/dim] {token_preview}\n"
+            f"[dim]Expires:[/dim] {expires_at}",
+            title="Dynamic Token Setup",
             box=ROUNDED,
             style="green"
         ))
     else:
         success(f"Connected to: {tenant_name}")
         print(f"  Tenant ID: {tenant_id}")
-        print(f"  Token: {access_token[:12]}...")
+        print(f"  Token: {token_preview}")
         print(f"  Expires: {expires_at}")
-    
-    return True
 
+    return True
 
 
 class TokenServiceError(Exception):
@@ -613,13 +622,11 @@ def _parse_iso8601(ts: str | None) -> Optional[datetime]:
         return None
 
 
-def fetch_token_from_service(base_url: str, api_key: str, tenant_id: str | None) -> Dict[str, Any]:
+def fetch_token_from_service(base_url: str, tenant_id: str | None) -> Dict[str, Any]:
     if not base_url:
         raise TokenServiceError('Token service URL is not configured.')
     url = base_url.rstrip('/') + '/api/xero/token'
     headers = {'Accept': 'application/json'}
-    if api_key:
-        headers['X-Api-Key'] = api_key
     params: Dict[str, str] = {}
     if tenant_id:
         params['tenantId'] = tenant_id
@@ -648,7 +655,7 @@ def ensure_bearer_token_from_service() -> Optional[Dict[str, Any]]:
         return None
     if not TOKEN_SERVICE_URL:
         return None
-    payload = fetch_token_from_service(TOKEN_SERVICE_URL, TOKEN_SERVICE_API_KEY, PREFERRED_TENANT_ID or None)
+    payload = fetch_token_from_service(TOKEN_SERVICE_URL, PREFERRED_TENANT_ID or None)
     os.environ['XERO_CLIENT_BEARER_TOKEN'] = payload['access_token']
     tenant = payload.get('tenant_id') or payload.get('tenantId')
     if tenant and not os.environ.get('XERO_TENANT_ID'):
@@ -734,6 +741,94 @@ def render_json_table_if_applicable(payload: dict):
                 print(f"{i} | " + " | ".join(str(r.get(k, ""))[:80] for k in keys))
             else:
                 print(f"{i} | " + " | ".join([""] * len(keys)))
+
+def _extract_rows_from_payload(payload: dict) -> Optional[List[Dict[str, Any]]]:
+    """
+    Find a tabular list[dict] inside a tool payload (shared logic with the table renderer).
+    Returns the list of rows, or None if not found.
+    """
+    if not payload:
+        return None
+    for p in payload.get("parts", []):
+        if p.get("type") == "json":
+            data = p.get("json")
+            if isinstance(data, list) and (not data or isinstance(data[0], dict)):
+                return data
+            if isinstance(data, dict):
+                for k in (
+                    "items",
+                    "results",
+                    "data",
+                    "contacts",
+                    "Contacts",
+                    "transactions",
+                    "Transactions",
+                    "invoices_rows",
+                    "totals_by_contact"
+                ):
+                    v = data.get(k)
+                    if isinstance(v, list) and (not v or isinstance(v[0], dict)):
+                        return v
+    return None
+
+def _select_keys_for_rows(rows: List[Dict[str, Any]]) -> List[str]:
+    """Choose up to 6 representative keys from the first few rows."""
+    keys: List[str] = []
+    for r in rows[:5]:
+        if isinstance(r, dict):
+            for k in r.keys():
+                if k not in keys:
+                    keys.append(k)
+                if len(keys) >= 6:
+                    break
+        if len(keys) >= 6:
+            break
+    return keys or ["id", "name", "date", "amount"]
+
+def summarize_payload_to_text(payload: dict, max_rows: int = 10) -> str:
+    """
+    Build a concise, parseable text summary from the last tool payload so the UI never stays blank.
+    Priority: tabular rows -> text parts -> short note about structured data.
+    """
+    if not payload:
+        return ""
+    rows = _extract_rows_from_payload(payload)
+    if rows is not None:
+        show = max(1, min(max_rows, len(rows)))
+        keys = _select_keys_for_rows(rows)
+        lines: List[str] = []
+        
+        # Check if this looks like expense data and provide context
+        if any(key in ['contact', 'amount', 'total'] for key in keys):
+            lines.append(f"**Found {len(rows)} expense items** (showing top {show}):")
+        else:
+            lines.append(f"Items: {len(rows)} rows (showing {show}).")
+            
+        lines.append(" | ".join(keys))
+        for r in rows[:show]:
+            if isinstance(r, dict):
+                lines.append(" | ".join(str(r.get(k, ""))[:80] for k in keys))
+            else:
+                lines.append(" | ".join([""] * len(keys)))
+        
+        # Add helpful summary for expense-like data
+        if len(rows) > 0 and isinstance(rows[0], dict) and 'amount' in rows[0]:
+            try:
+                total = sum(float(r.get('amount', 0)) for r in rows if r.get('amount'))
+                lines.append(f"\n**Total Amount:** ${total:,.2f}")
+            except:
+                pass
+                
+        return "\n".join(lines)
+
+    # Fallback to any text parts provided by the tool(s)
+    text_blocks = [p.get("text", "") for p in payload.get("parts", []) if p.get("type") == "text"]
+    body = "\n".join([t for t in text_blocks if t]).strip()
+    if body:
+        return truncate_str(body, 4000)
+
+    # Last resort: acknowledge structured data presence
+    return "Tool returned structured data. See the table above or use /export to save it."
 
 # ---------------------- Export helpers (generic) ----------------------
 def export_json(path: str, payload: dict):
@@ -987,7 +1082,7 @@ def _repair_orphaned_function_calls(history: List[types.Content]) -> None:
     parts = getattr(last, "parts", None)
     has_func_call = any(getattr(p, "function_call", None) for p in (parts or []))
     if role in ("assistant", "model") and has_func_call:
-        # No tool response followed → remove the dangling call turn
+        # No tool response followed -> remove the dangling call turn
         history.pop()
 
 # ---------------------- Chat Session ----------------------
@@ -997,7 +1092,6 @@ class ChatState:
         self.tool_names: List[str] = []
         self.last_tool_payload: Optional[dict] = None  # generic (for /export)
         self.page_size = DEFAULT_PAGE_SIZE
-        self.show_thinking = SHOW_THINKING
 
     def auto_page_size(self):
         try:
@@ -1022,20 +1116,15 @@ async def chat_loop(session: ClientSession):
     tools_resp = await session.list_tools()
     state.tool_names = [t.name for t in tools_resp.tools]
 
-    banner(state.show_thinking)
+    banner()
     info(f"Detected MCP tools: {', '.join(state.tool_names) or '(none found)'}")
 
     def build_config() -> types.GenerateContentConfig:
-        tk_cfg = types.ThinkingConfig(
-            include_thoughts=state.show_thinking,
-            thinking_budget=(THINKING_BUDGET if state.show_thinking else 0),
-        )
         return types.GenerateContentConfig(
-            system_instruction=SYSTEM,
+            system_instruction=get_system_prompt(),
             temperature=0,
             tools=[session],
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            thinking_config=tk_cfg,
             # IMPORTANT: Use an allowed MIME type. Markdown can still be sent as plain text.
             response_mime_type="text/plain",
         )
@@ -1045,11 +1134,7 @@ async def chat_loop(session: ClientSession):
         Send conversation to the model; if it asks for tool calls, run them with guardrails,
         return tool outputs, and iterate until a final answer is produced.
         """
-        iterations = 0
         while True:
-            iterations += 1
-            if iterations > MAX_TOOL_ITERATIONS:
-                return "I hit the tool-iteration limit; try refining your request."
 
             # Ensure no dangling assistant function_call before generation
             _repair_orphaned_function_calls(state.history_contents)
@@ -1061,12 +1146,6 @@ async def chat_loop(session: ClientSession):
                     config=build_config(),
                 )
 
-            # Optional thinking panel (human-readable summaries only)
-            if state.show_thinking:
-                thinking_text = extract_thinking(resp)
-                if thinking_text:
-                    display_thinking(thinking_text)
-
             # Collect function calls from first candidate deterministically
             function_calls = []
             cand = (resp.candidates or [None])[0]
@@ -1077,7 +1156,7 @@ async def chat_loop(session: ClientSession):
                     if getattr(part, "function_call", None):
                         function_calls.append(part.function_call)
 
-            # No tool calls → finalize
+            # No tool calls -> finalize
             if not function_calls:
                 if cand and cand.content:
                     state.history_contents.append(cand.content)
@@ -1122,7 +1201,7 @@ async def chat_loop(session: ClientSession):
     # ------------- Input setup -------------
     def build_session():
         completer_words = [
-            "/tools", "/call", "/export", "/thinking", "/help", "/quit"
+            "/tools", "/call", "/export", "/help", "/quit"
         ]
         if USE_PTK:
             completer = WordCompleter(completer_words, ignore_case=True, sentence=True, match_middle=True)
@@ -1137,7 +1216,7 @@ async def chat_loop(session: ClientSession):
             try:
                 with patch_stdout():
                     return await ptk_session.prompt_async(
-                        PTK_HTML('<b><ansicyan>you</ansicyan></b> ▸ ')
+                        PTK_HTML('<b><ansicyan>you</ansicyan></b> > ')
                     )
             except KeyboardInterrupt:
                 return ""
@@ -1149,10 +1228,9 @@ async def chat_loop(session: ClientSession):
     def show_help():
         cmds = [
             "/tools                        list available MCP tools",
-            "/call <name> <json-args>     call a tool directly, e.g. /call list-bank-transactions {\"pageSize\":10}",
+            "/call <name> <json-args>     call a tool directly, e.g. /call list-bank-transactions {{\"pageSize\":10}}",
             "/export json <path>          export last tool payload as JSON",
             "/export csv <path>           export last tool payload as CSV (best-effort if list[dict])",
-            "/thinking                    toggle thinking on/off (affects generation + budget)",
             "/help                        show this menu",
             "/quit                        exit",
         ]
@@ -1250,12 +1328,6 @@ async def chat_loop(session: ClientSession):
             parts = user.split()
             do_export(parts[1:])
             continue
-        if low == "/thinking":
-            state.show_thinking = not state.show_thinking
-            status = "enabled" if state.show_thinking else "disabled"
-            success(f"Thinking {status} (budget={THINKING_BUDGET if state.show_thinking else 0})")
-            banner(state.show_thinking)
-            continue
 
         # Otherwise: forward to the model (natural language)
         state.history_contents.append(types.UserContent(parts=[types.Part(text=user)]))
@@ -1268,7 +1340,15 @@ async def chat_loop(session: ClientSession):
             else:
                 print(f"\nAssistant: {final_text}")
         else:
-            warn("No user-visible text returned (model sent only tool calls or thoughts). Try /thinking off and ask again.")
+            # Fallback: synthesize from last tool payload so UI never appears blank
+            fallback_text = summarize_payload_to_text(state.last_tool_payload or {}) if state.last_tool_payload else ""
+            if fallback_text:
+                if USE_RICH:
+                    console.print(Panel(fallback_text, title="Assistant", box=ROUNDED, style=Style(color="white")))
+                else:
+                    print(f"\nAssistant: {fallback_text}")
+            else:
+                warn("No user-visible text returned (model sent only tool calls or thoughts). Try /thinking off and ask again.")
 
 # ---------------------- Entrypoint ----------------------
 async def main():
@@ -1291,40 +1371,23 @@ async def main():
             if selected_client_id:
                 bearer_token_set = setup_dynamic_token(selected_client_id)
                 if bearer_token_set:
-                    info("✅ Using dynamic token from database client selection")
+                    info("Using dynamic token from database client selection")
         except Exception as e:
-            warn(f"Client selection failed: {e}")
+            error(f"Client selection failed: {e}")
+            return  # Fail fast instead of falling back
     
-    # Step 2: Fallback to token service (EXISTING METHOD)
+    # Step 2: Remove fallback to token service - fail if database method doesn't work
     if not bearer_token_set:
-        info("Falling back to token service method...")
-        token_payload: Optional[Dict[str, Any]] = None
-        try:
-            token_payload = ensure_bearer_token_from_service()
-        except TokenServiceError as exc:
-            if os.environ.get('XERO_CLIENT_ID'):
-                warn(f"Token service fetch failed ({exc}); falling back to client credentials.")
-            else:
-                raise RuntimeError(f"Failed to fetch Xero access token: {exc}") from exc
+        error("No valid authentication method available. Please ensure:")
+        error("1. Database connection is working and contains valid Xero tokens")
+        error("2. Tokens are not expired - complete OAuth flow if needed")
+        error("3. Run: python server/app.py and visit http://localhost:8000 to refresh tokens")
+        return
 
-        if token_payload:
-            tenant = token_payload.get('tenant_id') or token_payload.get('tenantId') or '(unknown tenant)'
-            expires = _parse_iso8601(token_payload.get('expires_at'))
-            info(f"Using bearer token from token service for tenant {tenant}.")
-            if expires:
-                remaining = max(0, int((expires - datetime.now(timezone.utc)).total_seconds() // 60))
-                info(f"Token expires at {expires.isoformat()} (~{remaining} min remaining).")
-            else:
-                warn('Token service did not return a parseable expires_at; continuing anyway.')
-            bearer_token_set = True
-
-    # Step 3: Final validation
-    if not os.environ.get('XERO_CLIENT_BEARER_TOKEN') and not os.environ.get('XERO_CLIENT_ID'):
-        warn('Neither XERO_CLIENT_BEARER_TOKEN nor XERO_CLIENT_ID is set; the MCP server may fail to authenticate.')
-        if DATABASE_AVAILABLE:
-            warn('Suggestion: Ensure you have completed OAuth flow and have clients in database.')
-        else:
-            warn('Suggestion: Set up database connection or configure XERO_CLIENT_ID/SECRET in .env')
+    # Step 3: Validate we have a bearer token
+    if not os.environ.get('XERO_CLIENT_BEARER_TOKEN'):
+        error('No valid Xero authentication token available. Cannot proceed.')
+        return
 
     # You can override the MCP server via env if desired
     mcp_command = os.environ.get("MCP_COMMAND", "npx")

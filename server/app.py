@@ -7,7 +7,7 @@ from pathlib import Path
 import requests
 import uvicorn
 import sys
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 # Load .env file from parent directory if it exists
@@ -76,7 +76,6 @@ def _normalize_redirect_base(raw: str) -> str:
 # ---- Config (env) ----
 CLIENT_ID = get_env("XERO_CLIENT_ID")
 CLIENT_SECRET = get_env("XERO_CLIENT_SECRET")
-INTERNAL_API_KEY = get_env("INTERNAL_API_KEY")
 RAW_REDIRECT_BASE_URL = get_env("REDIRECT_BASE_URL")
 print(f"[DEBUG] RAW_REDIRECT_BASE_URL from env: '{RAW_REDIRECT_BASE_URL}'")
 REDIRECT_BASE_URL = _normalize_redirect_base(RAW_REDIRECT_BASE_URL)  # e.g., https://<ngrok>.ngrok.io
@@ -107,24 +106,11 @@ def require_base_redirect() -> str:
     return REDIRECT_BASE_URL.rstrip("/")
 
 
-def validate_api_key(x_api_key: str = Header(None)) -> str:
-    """Validate API key for token service access"""
-    if not INTERNAL_API_KEY:
-        raise HTTPException(status_code=500, detail="INTERNAL_API_KEY is not configured")
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="Missing X-Api-Key header")
-    if x_api_key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API key")
-    return x_api_key
-
-
 @APP.on_event("startup")
 def _startup():
     print("[INFO] Starting Xero OAuth Backend - Production Mode")
     if not CLIENT_ID or not CLIENT_SECRET:
         print("[WARN] XERO_CLIENT_ID/SECRET not set yet. /api/xero/authorize will fail.")
-    if not INTERNAL_API_KEY:
-        print("[WARN] INTERNAL_API_KEY not set. Token service will be inaccessible.")
     if not DATABASE_URL:
         print("[WARN] DATABASE_URL not set. Set to your Neon Postgres URL.")
     else:
@@ -196,7 +182,6 @@ def home():
         <div style='background: #d1ecf1; padding: 15px; border-radius: 5px; margin: 10px 0;'>
           <h4>🔒 Production Mode Notes:</h4>
           <ul>
-            <li>API key authentication is enabled for token endpoints</li>
             <li>Tokens are securely stored in PostgreSQL database</li>
             <li>Automatic token refresh with 30-second safety buffer</li>
             <li>Ready for MCP client integration</li>
@@ -428,7 +413,7 @@ def clear_users():
 
 
 @APP.get("/api/xero/token")
-def xero_token(tenantId: str | None = Query(None), api_key: str = Depends(validate_api_key)):
+def xero_token(tenantId: str | None = Query(None)):
     # Get user by tenant ID or get most recent
     row = get_user_by_tenant_id(tenantId)
     if not row:
