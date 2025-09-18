@@ -4,30 +4,63 @@ A comprehensive system for integrating with Xero accounting software using Model
 
 ## Architecture Overview
 
-```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Client    │────▶│  OAuth Flow  │───▶│   NeonDB     │
-│  Browser    │     │ (server/app) │     │  (Postgres)  │
-└─────────────┘     └──────────────┘     └──────────────┘
-                            │                      │
-                            ▼                      ▼
-                    ┌──────────────┐     ┌──────────────┐
-                    │ Xero OAuth   │     │ Token Store  │
-                    │   Service    │     │   & Refresh  │
-                    └──────────────┘     └──────────────┘
-                                                   │
-                    ┌──────────────────────────────
-                    ▼                            
-            ┌──────────────┐              ┌──────────────┐
-            │ mcp_client.py│              │Xero MCP      │
-            │   (Chat UI)  │◀───────────▶│   Server     │
-            └──────────────┘              └──────────────┘
-                    │                              
-                    ▼                              
-            ┌──────────────┐
-            │  Gemini AI   │
-            │  (2.5 Flash) │              
-            └──────────────┘              
+```mermaid
+graph TD
+    subgraph "User"
+        direction LR
+        Browser[("Browser")]
+        CLI[("CLI")]
+    end
+
+    subgraph "Xero MCP Integration System"
+        direction TB
+
+        subgraph "Authentication"
+            direction LR
+            AuthServer("FastAPI Server")
+            XeroOAuth("Xero OAuth")
+            Database[(NeonDB)]
+
+            Browser -- "1. Initiate OAuth" --> AuthServer
+            AuthServer -- "2. Redirect" --> XeroOAuth
+            XeroOAuth -- "3. User Consent" --> AuthServer
+            AuthServer -- "4. Exchange Code for Tokens" --> XeroOAuth
+            XeroOAuth -- "5. Return Tokens" --> AuthServer
+            AuthServer -- "6. Store Tokens" --> Database
+        end
+
+        subgraph "Chat Interaction"
+            direction TB
+            MCPClient("MCP Client")
+            GeminiAI("Gemini AI")
+            XeroMCP("Xero MCP Server")
+            XeroAPI("Xero API")
+
+            CLI -- "1. Start Chat" --> MCPClient
+            MCPClient -- "2. Load Tokens" --> Database
+            MCPClient -- "3. Send Prompt" --> GeminiAI
+            GeminiAI -- "4. Determine Tool Call" --> MCPClient
+            MCPClient -- "5. Execute Tool Call" --> XeroMCP
+            XeroMCP -- "6. Call Xero API" --> XeroAPI
+            XeroAPI -- "7. Return Data" --> XeroMCP
+            XeroMCP -- "8. Return Result" --> MCPClient
+            MCPClient -- "9. Display Result" --> CLI
+        end
+
+        subgraph "Token Management"
+            direction TB
+            TokenRefresh("Token Refresh Script")
+
+            TokenRefresh -- "1. Check for Expired Tokens" --> Database
+            TokenRefresh -- "2. Refresh Token" --> XeroOAuth
+            XeroOAuth -- "3. Return New Tokens" --> TokenRefresh
+            TokenRefresh -- "4. Update Tokens" --> Database
+            MCPClient -- "On-demand Refresh" --> TokenRefresh
+        end
+    end
+
+    style Browser fill:#f9f,stroke:#333,stroke-width:2px
+    style CLI fill:#f9f,stroke:#333,stroke-width:2px
 ```
 
 ## Components
@@ -258,4 +291,3 @@ The system has access to 40+ Xero MCP tools including:
 - Tracking categories
 
 Full tool documentation: [Xero MCP Server](https://github.com/XeroAPI/xero-mcp-server)
-

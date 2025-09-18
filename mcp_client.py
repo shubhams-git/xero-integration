@@ -30,58 +30,16 @@ load_dotenv()  # Load .env file, won't override existing env vars
 
 # ------------ Database connectivity for client selection ------------
 try:
-    import psycopg
-    from contextlib import contextmanager
-    
-    def get_database_url() -> str:
-        """Get database URL from environment"""
-        raw = os.getenv("DATABASE_URL", "")
-        if not raw:
-            return ""
-        return raw.strip().strip('"').strip("'")
-    
-    @contextmanager
-    def get_db_conn():
-        """Get database connection"""
-        url = get_database_url()
-        if not url:
-            raise RuntimeError("DATABASE_URL is not set")
-        with psycopg.connect(url, autocommit=True) as conn:
-            yield conn
-    
-    def list_available_clients() -> List[Tuple[int, str, str, str, str]]:
-        """List all available Xero clients from database"""
-        try:
-            with get_db_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT id, tenant_id, tenant_name, expires_at, updated_at
-                        FROM xero_users 
-                        ORDER BY updated_at DESC
-                    """)
-                    return cur.fetchall()
-        except Exception as e:
-            print(f"[WARN] Failed to fetch clients from database: {e}")
-            return []
-    
-    def get_client_by_id(client_id: int) -> Optional[Tuple[int, str, str, str, str, str]]:
-        """Get client details by ID"""
-        try:
-            with get_db_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT id, tenant_id, tenant_name, access_token, refresh_token, expires_at 
-                        FROM xero_users 
-                        WHERE id = %s
-                    """, (client_id,))
-                    return cur.fetchone()
-        except Exception as e:
-            print(f"[WARN] Failed to fetch client {client_id}: {e}")
-            return None
-    
+    # Add the parent directory to the path to find the 'server' module
+    PACKAGE_ROOT = Path(__file__).resolve().parent
+    if str(PACKAGE_ROOT) not in sys.path:
+        sys.path.insert(0, str(PACKAGE_ROOT))
+    from server.db import list_available_clients, get_client_by_id
     DATABASE_AVAILABLE = True
-except ImportError:
-    print("[WARN] psycopg not available - client selection disabled")
+except (ImportError, ModuleNotFoundError):
+    print("[WARN] psycopg or server module not available - client selection disabled")
+    def list_available_clients(): return []
+    def get_client_by_id(client_id: int): return None
     DATABASE_AVAILABLE = False
 
 # ------------ Optional UX libs (graceful fallback) ------------

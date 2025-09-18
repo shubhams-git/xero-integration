@@ -33,15 +33,36 @@ def get_conn():
 
 
 # Simple state management (using a temporary dict for OAuth states)
-_oauth_states = {}
-
 def save_state(state: str):
     """Save OAuth state temporarily"""
-    _oauth_states[state] = True
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO oauth_states (state) VALUES (%s)", (state,))
 
 def pop_state(state: str) -> bool:
     """Check and remove OAuth state"""
-    return _oauth_states.pop(state, False)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT state FROM oauth_states WHERE state = %s", (state,))
+        found = cur.fetchone()
+        if found:
+            cur.execute("DELETE FROM oauth_states WHERE state = %s", (state,))
+            return True
+        return False
+
+def get_all_users():
+    """List all stored Xero connections for debugging"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT tenant_id, tenant_name, expires_at, connected_at, updated_at 
+            FROM xero_users 
+            ORDER BY updated_at DESC
+        """)
+        return cur.fetchall()
+
+def delete_all_users():
+    """Clear all stored Xero connections for testing"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM xero_users")
+        return cur.rowcount
 
 def save_user(tenant_id: str, tenant_name: str, access_token: str, refresh_token: str, expires_at_iso: str):
     """Save or update user connection info"""
@@ -86,3 +107,22 @@ def update_user_tokens(tenant_id: str, access_token: str, refresh_token: str, ex
             (access_token, refresh_token or "", expires_at_iso, tenant_id)
         )
 
+def list_available_clients():
+    """List all available Xero clients from database"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, tenant_id, tenant_name, expires_at, updated_at
+            FROM xero_users 
+            ORDER BY updated_at DESC
+        """)
+        return cur.fetchall()
+
+def get_client_by_id(client_id: int):
+    """Get client details by ID"""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, tenant_id, tenant_name, access_token, refresh_token, expires_at 
+            FROM xero_users 
+            WHERE id = %s
+        """, (client_id,))
+        return cur.fetchone()

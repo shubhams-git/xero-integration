@@ -9,28 +9,11 @@ import uvicorn
 import sys
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from dotenv import load_dotenv
 
 # Load .env file from parent directory if it exists
-env_file = Path("../.env")
-if env_file.exists():
-    print(f"[INFO] Loading environment from {env_file}")
-    with open(env_file) as f:
-        for line in f:
-            if "=" in line and not line.strip().startswith("#"):
-                key, value = line.strip().split("=", 1)
-                if key not in os.environ:  # Don't override existing env vars
-                    os.environ[key] = value
-else:
-    # Also check current directory for .env
-    local_env = Path(".env")
-    if local_env.exists():
-        print(f"[INFO] Loading environment from {local_env}")
-        with open(local_env) as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    key, value = line.strip().split("=", 1)
-                    if key not in os.environ:  # Don't override existing env vars
-                        os.environ[key] = value
+load_dotenv(dotenv_path=Path("../.env"))
+load_dotenv()
 
 try:
     from .config import CALLBACK_SUFFIX, get_database_url, get_env
@@ -41,6 +24,8 @@ try:
         save_user,
         get_user_by_tenant_id,
         update_user_tokens,
+        get_all_users,
+        delete_all_users,
     )
 except ImportError:
     PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +39,8 @@ except ImportError:
         save_user,
         get_user_by_tenant_id,
         update_user_tokens,
+        get_all_users,
+        delete_all_users,
     )
 
 
@@ -357,31 +344,22 @@ def _refresh_token(refresh_token: str) -> dict:
 def list_users():
     """List all stored Xero connections for debugging"""
     try:
-        from .db import get_conn
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT tenant_id, tenant_name, expires_at, connected_at, updated_at 
-                    FROM xero_users 
-                    ORDER BY updated_at DESC
-                """)
-                users = cur.fetchall()
-                
-                result = []
-                for row in users:
-                    result.append({
-                        "tenant_id": row[0],
-                        "tenant_name": row[1], 
-                        "expires_at": str(row[2]),
-                        "connected_at": str(row[3]),
-                        "updated_at": str(row[4])
-                    })
-                
-                return JSONResponse({
-                    "status": "success",
-                    "count": len(result),
-                    "users": result
-                })
+        users = get_all_users()
+        result = []
+        for row in users:
+            result.append({
+                "tenant_id": row[0],
+                "tenant_name": row[1], 
+                "expires_at": str(row[2]),
+                "connected_at": str(row[3]),
+                "updated_at": str(row[4])
+            })
+        
+        return JSONResponse({
+            "status": "success",
+            "count": len(result),
+            "users": result
+        })
     except Exception as e:
         return JSONResponse({
             "status": "error",
@@ -393,18 +371,12 @@ def list_users():
 def clear_users():
     """Clear all stored Xero connections for testing"""
     try:
-        from .db import get_conn
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM xero_users")
-                cur.execute("SELECT ROW_COUNT()")
-                deleted_count = cur.fetchone()[0] if cur.rowcount >= 0 else 0
-                
-                return JSONResponse({
-                    "status": "success",
-                    "message": f"Deleted {deleted_count} user connections",
-                    "deleted_count": deleted_count
-                })
+        deleted_count = delete_all_users()
+        return JSONResponse({
+            "status": "success",
+            "message": f"Deleted {deleted_count} user connections",
+            "deleted_count": deleted_count
+        })
     except Exception as e:
         return JSONResponse({
             "status": "error", 
