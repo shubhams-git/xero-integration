@@ -102,8 +102,8 @@ def _refresh_via_xero(refresh_token: str) -> dict:
 
 class RefreshResult:
     """Container for token refresh results with detailed status information."""
-    def __init__(self, success: bool, client_id: int = None, tenant_name: str = None, 
-                 error_message: str = None, new_expiry: datetime = None):
+    def __init__(self, success: bool, client_id: Optional[int] = None, tenant_name: Optional[str] = None,
+                 error_message: Optional[str] = None, new_expiry: Optional[datetime] = None):
         self.success = success
         self.client_id = client_id
         self.tenant_name = tenant_name

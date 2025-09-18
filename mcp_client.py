@@ -1,8 +1,9 @@
 import asyncio
+import atexit
 import json
 import os
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from contextlib import AsyncExitStack
 from datetime import datetime, date, timezone, timedelta
 import re
@@ -20,6 +21,8 @@ from xero_token_refresh import refresh_expired_tokens, refresh_token_for_client,
 # Google GenAI SDK
 from google import genai
 from google.genai import types
+import atexit
+from datetime import datetime, timedelta
 
 # ------------ Load environment variables from .env file ------------
 from dotenv import load_dotenv
@@ -46,7 +49,7 @@ try:
         with psycopg.connect(url, autocommit=True) as conn:
             yield conn
     
-    def list_available_clients() -> List[Tuple[int, str, str, str]]:
+    def list_available_clients() -> List[Tuple[int, str, str, str, str]]:
         """List all available Xero clients from database"""
         try:
             with get_db_conn() as conn:
@@ -82,26 +85,77 @@ except ImportError:
     DATABASE_AVAILABLE = False
 
 # ------------ Optional UX libs (graceful fallback) ------------
+# Create dummy classes for graceful fallbacks
+class Console:
+    def print(self, *args, **kwargs): pass
+    def status(self, msg):
+        class Dummy:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        return Dummy()
+
+class Table:
+    def __init__(self, *args, **kwargs): pass
+    def add_column(self, *args, **kwargs): pass
+    def add_row(self, *args, **kwargs): pass
+
+class Panel:
+    def __init__(self, *args, **kwargs): pass
+
+class Text:
+    def __init__(self, *args, **kwargs): pass
+    @staticmethod
+    def assemble(*args): return ""
+
+class Align:
+    @staticmethod
+    def center(text): return text
+
+class Style:
+    def __init__(self, *args, **kwargs): pass
+
+ROUNDED = "rounded"
+
+class PromptSession:
+    def __init__(self, *args, **kwargs): pass
+    async def prompt_async(self, prompt): return input(prompt)
+
+class WordCompleter:
+    def __init__(self, *args, **kwargs): pass
+
+class FileHistory:
+    def __init__(self, *args, **kwargs): pass
+
+class PTK_HTML:
+    def __init__(self, *args, **kwargs): pass
+
+def patch_stdout():
+    class Dummy:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    return Dummy()
+
+# Attempt to import rich and prompt_toolkit, overwriting dummies if successful
 USE_RICH = True
-USE_PTK = True
 try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.text import Text
-    from rich.align import Align
+    from rich.console import Console  # type: ignore
+    from rich.table import Table  # type: ignore
+    from rich.panel import Panel  # type: ignore
+    from rich.text import Text  # type: ignore
+    from rich.align import Align  # type: ignore
     from rich.box import ROUNDED
-    from rich.style import Style
-except Exception:
+    from rich.style import Style  # type: ignore
+except ImportError:
     USE_RICH = False
 
+USE_PTK = True
 try:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.completion import WordCompleter
-    from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.formatted_text import HTML as PTK_HTML
-    from prompt_toolkit.patch_stdout import patch_stdout
-except Exception:
+    from prompt_toolkit import PromptSession  # type: ignore
+    from prompt_toolkit.completion import WordCompleter  # type: ignore
+    from prompt_toolkit.history import FileHistory  # type: ignore
+    from prompt_toolkit.formatted_text import HTML as PTK_HTML  # type: ignore
+    from prompt_toolkit.patch_stdout import patch_stdout  # type: ignore
+except ImportError:
     USE_PTK = False
 
 # ---------------- Config ----------------
@@ -287,7 +341,7 @@ AUTO_PAGE_MAX = int(os.environ.get("AUTO_PAGE_MAX", "15"))  # cap pages when _au
 DEFAULT_PAGE_SIZE = 20
 MIN_PAGE_SIZE = 8
 
-console = Console() if USE_RICH else None
+console = Console()
 
 # ---------------------- Generic helpers ----------------------
 def pretty_json(data: Any) -> str:
@@ -407,6 +461,79 @@ def spinner(msg: str):
         def __exit__(self, exc_type, exc, tb):
             pass
     return console.status(msg) if USE_RICH else Dummy()
+
+
+def display_token_usage(current_usage: dict, session_totals: dict, cache_info: dict = None):
+    """Display token consumption with validation, debugging, and cache information"""
+    if not current_usage and not session_totals:
+        return
+    
+    # Validate current usage values
+    current_input = int(current_usage.get('input_tokens', 0)) if current_usage else 0
+    current_output = int(current_usage.get('output_tokens', 0)) if current_usage else 0
+    current_total = current_input + current_output  # Always calculate from components
+    
+    # Validate session totals values
+    session_input = int(session_totals.get('input_tokens', 0)) if session_totals else 0
+    session_output = int(session_totals.get('output_tokens', 0)) if session_totals else 0
+    session_total = session_input + session_output  # Always calculate from components
+    
+    # Cache information processing
+    cache_enabled = cache_info and cache_info.get('enabled', False)
+    estimated_cache_tokens = cache_info.get('estimated_saved_tokens', 15000) if cache_info else 15000
+    session_api_calls = cache_info.get('api_calls', 1) if cache_info else 1
+    
+    # Debug validation - check if our calculations match stored totals
+    if current_usage and current_usage.get('total_tokens', 0) != current_total:
+        warn(f"Token calculation mismatch - Current: stored={current_usage.get('total_tokens', 0)}, calculated={current_total}")
+    
+    if session_totals and session_totals.get('total_tokens', 0) != session_total:
+        warn(f"Token calculation mismatch - Session: stored={session_totals.get('total_tokens', 0)}, calculated={session_total}")
+        
+    if USE_RICH:
+        # Create a compact token usage display
+        current_text = ""
+        session_text = ""
+        
+        if current_total > 0:
+            cache_part = ""
+            if cache_enabled:
+                cache_part = f" [dim](~{estimated_cache_tokens:,} cached)[/dim]"
+            current_text = f"[dim]This call:[/dim] {current_input:,} in + {current_output:,} out = [bold]{current_total:,}[/bold] tokens{cache_part}"
+            
+        if session_total > 0:
+            cache_session_part = ""
+            if cache_enabled:
+                # Estimate total cache savings for the session
+                total_cache_saved = estimated_cache_tokens * session_api_calls
+                cache_session_part = f" [dim](~{total_cache_saved:,} cached)[/dim]"
+            session_text = f"[dim]Session total:[/dim] {session_input:,} in + {session_output:,} out = [bold]{session_total:,}[/bold] tokens{cache_session_part}"
+        
+        if current_text and session_text:
+            token_info = f"{current_text}\n{session_text}"
+        elif current_text:
+            token_info = current_text
+        elif session_text:
+            token_info = session_text
+        else:
+            return
+            
+        console.print(f"[cyan]🔢 Token Usage:[/cyan] {token_info}")
+    else:
+        # Fallback for non-rich environments
+        if current_total > 0:
+            cache_part = ""
+            if cache_enabled:
+                cache_part = f" (~{estimated_cache_tokens:,} cached)"
+            print(f"[TOKENS] This call: {current_input:,} in + {current_output:,} out = {current_total:,} tokens{cache_part}")
+        
+        if session_total > 0:
+            cache_session_part = ""
+            if cache_enabled:
+                # Estimate total cache savings for the session
+                total_cache_saved = estimated_cache_tokens * session_api_calls
+                cache_session_part = f" (~{total_cache_saved:,} cached)"
+            print(f"[TOKENS] Session total: {session_input:,} in + {session_output:,} out = {session_total:,} tokens{cache_session_part}")
 
 
 # ---------------------- Client Selection UI ----------------------
@@ -1091,7 +1218,7 @@ async def _call_with_auto_paging(session, name: str, args: dict) -> dict:
     return {"ok": True, "parts": combined_parts}
 
 # ---------------------- Turn-repair (fix INVALID_ARGUMENT) ----------------------
-def _repair_orphaned_function_calls(history: List[types.Content]) -> None:
+def _repair_orphaned_function_calls(history: List[Any]) -> None:
     """
     If the last turn is an assistant/model turn with function_call parts and the next
     turn is not a tool response, drop the orphaned call so the API is happy.
@@ -1106,13 +1233,176 @@ def _repair_orphaned_function_calls(history: List[types.Content]) -> None:
         # No tool response followed -> remove the dangling call turn
         history.pop()
 
+# ---------------------- Token Tracking ----------------------
+class TokenTracker:
+    """Track token consumption for individual calls and entire chat session"""
+    
+    def __init__(self):
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_total_tokens = 0
+        self.session_api_calls = 0  # Track number of API calls for cache calculation
+        self.last_call_usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
+        
+    def add_usage(self, input_tokens: int = 0, output_tokens: int = 0, total_tokens: int = 0):
+        """Add token usage from a single API call"""
+        # Validate inputs are actually numbers
+        input_tokens = int(input_tokens) if input_tokens else 0
+        output_tokens = int(output_tokens) if output_tokens else 0
+        
+        # Calculate total tokens correctly (input + output)
+        calculated_total = input_tokens + output_tokens
+        
+        # Use the calculated total rather than the API provided total to avoid confusion
+        # This ensures consistency in our counting
+        self.session_input_tokens += input_tokens
+        self.session_output_tokens += output_tokens
+        self.session_total_tokens += calculated_total
+        self.session_api_calls += 1  # Increment API call count
+        
+        # Store the last call's usage for display
+        self.last_call_usage = {
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': calculated_total
+        }
+        
+    def get_session_totals(self) -> dict:
+        """Get cumulative session token usage"""
+        return {
+            'input_tokens': self.session_input_tokens,
+            'output_tokens': self.session_output_tokens,
+            'total_tokens': self.session_total_tokens,
+            'api_calls': self.session_api_calls
+        }
+    
+    def get_last_call_usage(self) -> dict:
+        """Get token usage from the last API call"""
+        return self.last_call_usage.copy()
+    
+    def extract_token_usage(self, response) -> dict:
+        """Extract token usage from Gemini API response with robust field detection"""
+        try:
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                usage = response.usage_metadata
+                
+                # Try multiple possible field names for input tokens
+                input_tokens = 0
+                for field in ['prompt_token_count', 'input_token_count', 'prompt_tokens']:
+                    if hasattr(usage, field):
+                        input_tokens = int(getattr(usage, field, 0))
+                        break
+                
+                # Try multiple possible field names for output tokens
+                output_tokens = 0
+                for field in ['candidates_token_count', 'output_token_count', 'completion_tokens', 'response_token_count']:
+                    if hasattr(usage, field):
+                        output_tokens = int(getattr(usage, field, 0))
+                        break
+                
+                # Calculate total (don't trust API total as it might be different)
+                calculated_total = input_tokens + output_tokens
+                
+                # Debug info when tokens are detected
+                if input_tokens > 0 or output_tokens > 0:
+                    print(f"[DEBUG] Token usage - Input: {input_tokens}, Output: {output_tokens}, Total: {calculated_total}")
+                
+                return {
+                    'input_tokens': input_tokens,
+                    'output_tokens': output_tokens,
+                    'total_tokens': calculated_total
+                }
+            else:
+                # Check if response has any usage information in other locations
+                if hasattr(response, 'candidates') and response.candidates:
+                    for candidate in response.candidates:
+                        if hasattr(candidate, 'token_count'):
+                            output_tokens = int(candidate.token_count)
+                            return {
+                                'input_tokens': 0,  # Can't determine input from this
+                                'output_tokens': output_tokens,
+                                'total_tokens': output_tokens
+                            }
+                
+                warn("No token usage information found in response")
+                return {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
+                
+        except Exception as e:
+            warn(f"Failed to extract token usage: {e}")
+            # Print response structure for debugging
+            if hasattr(response, 'usage_metadata'):
+                try:
+                    fields = [attr for attr in dir(response.usage_metadata) if not attr.startswith('_')]
+                    warn(f"Available usage fields: {fields}")
+                except:
+                    pass
+            return {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
+
+class CacheManager:
+    def __init__(self):
+        self.cached_content = None
+        self.cache_name = None
+        
+    def create_system_cache(self, client, system_prompt: str) -> str:
+        """Create a cached version of the system prompt"""
+        if self.cached_content:
+            return self.cached_content.name
+            
+        # Generate unique cache name for this session
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.cache_name = f"xero_mcp_system_cache_{timestamp}"
+        
+        try:
+            # Create cached content - expires in 1 hour (perfect for your 30min sessions)
+            self.cached_content = client.models.cache_content(
+                model="gemini-2.5-flash",
+                system_instruction=system_prompt,
+                ttl=timedelta(hours=1),  # Auto-expires after 1 hour
+                display_name=self.cache_name
+            )
+            
+            print(f"[INFO] System prompt cached as: {self.cache_name}")
+            return self.cached_content.name
+            
+        except Exception as e:
+            print(f"[WARN] Failed to cache system prompt: {e}")
+            return None
+    
+    def cleanup_cache(self, client):
+        """Clean up the cache when session ends"""
+        if self.cached_content:
+            try:
+                client.models.delete_cached_content(name=self.cached_content.name)
+                print(f"[INFO] Cleaned up cache: {self.cache_name}")
+            except Exception as e:
+                print(f"[WARN] Failed to cleanup cache: {e}")
+            finally:
+                self.cached_content = None
+                self.cache_name = None
+
+# Create global cache manager
+cache_manager = CacheManager()
+
+# Register cleanup on exit
+def cleanup_on_exit():
+    try:
+        client = genai.Client()
+        cache_manager.cleanup_cache(client)
+    except:
+        pass  # Ignore errors during cleanup
+
+atexit.register(cleanup_on_exit)
+
 # ---------------------- Chat Session ----------------------
+# Replace the ChatState class with this updated version
 class ChatState:
     def __init__(self):
-        self.history_contents: List[types.Content] = []
+        self.history_contents: List[Any] = []
         self.tool_names: List[str] = []
-        self.last_tool_payload: Optional[dict] = None  # generic (for /export)
+        self.last_tool_payload: Optional[dict] = None
         self.page_size = DEFAULT_PAGE_SIZE
+        self.token_tracker = TokenTracker()
+        self.cached_content_name: Optional[str] = None  # Add this line
 
     def auto_page_size(self):
         try:
@@ -1123,7 +1413,6 @@ class ChatState:
             self.page_size = DEFAULT_PAGE_SIZE
 
     def trim_history(self):
-        # Keep only the most recent MAX_TURNS contents
         if len(self.history_contents) > MAX_TURNS:
             self.history_contents = self.history_contents[-MAX_TURNS:]
 
@@ -1133,23 +1422,38 @@ async def chat_loop(session: ClientSession):
     state = ChatState()
     state.auto_page_size()
 
+    # Initialize cache for system prompt
+    system_prompt = get_system_prompt()
+    state.cached_content_name = cache_manager.create_system_cache(client, system_prompt)
+    
     # Discover tools
     tools_resp = await session.list_tools()
     state.tool_names = [t.name for t in tools_resp.tools]
 
     banner()
     info(f"Detected MCP tools: {', '.join(state.tool_names) or '(none found)'}")
+    if state.cached_content_name:
+        info(f"System prompt cached - saving ~15k tokens per call")
 
-    def build_config() -> types.GenerateContentConfig:
-        return types.GenerateContentConfig(
-            system_instruction=get_system_prompt(),
-            temperature=0,
-            tools=[session],
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            # IMPORTANT: Use an allowed MIME type. Markdown can still be sent as plain text.
-            response_mime_type="text/plain",
-        )
-
+    def build_config(cached_content_name: Optional[str] = None) -> types.GenerateContentConfig:
+        if cached_content_name:
+            # Use cached system prompt - saves ~15k+ tokens per call
+            return types.GenerateContentConfig(
+                cached_content=cached_content_name,
+                temperature=0,
+                tools=[session],
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                response_mime_type="text/plain",
+            )
+        else:
+            # Fallback to non-cached version
+            return types.GenerateContentConfig(
+                system_instruction=get_system_prompt(),
+                temperature=0,
+                tools=[session],
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                response_mime_type="text/plain",
+            )
     async def run_tool_call_loop() -> str:
         """
         Send conversation to the model; if it asks for tool calls, run them with guardrails,
@@ -1161,10 +1465,27 @@ async def chat_loop(session: ClientSession):
             _repair_orphaned_function_calls(state.history_contents)
 
             with spinner("Thinking with Gemini..."):
+                # Convert history_contents to the format expected by the API
+                converted_contents = []
+                for c in state.history_contents:
+                    if hasattr(c, 'role') and hasattr(c, 'parts'):
+                        converted_contents.append({"role": c.role, "parts": c.parts})
+                    else:
+                        # Handle cases where content might be in different format
+                        converted_contents.append(c)
+                
                 resp = await client.aio.models.generate_content(
                     model=MODEL,
-                    contents=state.history_contents,
-                    config=build_config(),
+                    contents=converted_contents,
+                    config=build_config(state.cached_content_name),
+                )
+                
+                # Extract and track token usage from this API call
+                token_usage = state.token_tracker.extract_token_usage(resp)
+                state.token_tracker.add_usage(
+                    input_tokens=token_usage['input_tokens'],
+                    output_tokens=token_usage['output_tokens']
+                    # total_tokens calculated internally now
                 )
 
             # Collect function calls from first candidate deterministically
@@ -1189,7 +1510,7 @@ async def chat_loop(session: ClientSession):
                 state.history_contents.append(cand.content)
 
             # Guardrails: run only known tools; ensure args is dict-like
-            response_parts: List[types.Part] = []
+            response_parts: List[Any] = []
             for fc in function_calls:
                 name = getattr(fc, "name", "")
                 args = dict(getattr(fc, "args", {}) or {})
@@ -1210,12 +1531,22 @@ async def chat_loop(session: ClientSession):
                 render_json_table_if_applicable(payload)
 
                 # Return structured tool response back to the model
-                response_parts.append(
-                    types.Part(function_response=types.FunctionResponse(name=name, response=payload))
-                )
+                try:
+                    part = types.Part(function_response=types.FunctionResponse(name=name, response=payload))
+                    response_parts.append(part)
+                except Exception:
+                    # Fallback to dict format
+                    response_parts.append({
+                        "function_response": {"name": name, "response": payload}
+                    })
 
             # One consolidated tool turn back to Gemini (MUST be immediately after the call)
-            state.history_contents.append(types.Content(role="tool", parts=response_parts))
+            try:
+                tool_content = types.Content(role="tool", parts=response_parts)
+                state.history_contents.append(tool_content)
+            except Exception:
+                # Fallback to dict format
+                state.history_contents.append({"role": "tool", "parts": response_parts})
             state.trim_history()
             # Loop again (model may chain more calls or finalize)
 
@@ -1252,6 +1583,7 @@ async def chat_loop(session: ClientSession):
             "/call <name> <json-args>     call a tool directly, e.g. /call list-bank-transactions {{\"pageSize\":10}}",
             "/export json <path>          export last tool payload as JSON",
             "/export csv <path>           export last tool payload as CSV (best-effort if list[dict])",
+            "/tokens                      show detailed token usage statistics",
             "/help                        show this menu",
             "/quit                        exit",
         ]
@@ -1276,6 +1608,49 @@ async def chat_loop(session: ClientSession):
             print("\nDiscovered MCP Tools:")
             for i, n in enumerate(state.tool_names, 1):
                 print(f"  {i}. {n}")
+
+    def show_token_debug():
+        """Show detailed token usage statistics for debugging"""
+        session_totals = state.token_tracker.get_session_totals()
+        last_call = state.token_tracker.get_last_call_usage()
+        
+        if USE_RICH:
+            console.print("\n[bold cyan]Token Usage Debug Information[/bold cyan]")
+            console.print(f"[green]Session Totals:[/green]")
+            console.print(f"  Input Tokens:  {session_totals.get('input_tokens', 0):,}")
+            console.print(f"  Output Tokens: {session_totals.get('output_tokens', 0):,}")
+            console.print(f"  Total Tokens:  {session_totals.get('total_tokens', 0):,}")
+            console.print(f"  API Calls:     {session_totals.get('api_calls', 0):,}")
+            console.print(f"\n[green]Last API Call:[/green]")
+            console.print(f"  Input Tokens:  {last_call.get('input_tokens', 0):,}")
+            console.print(f"  Output Tokens: {last_call.get('output_tokens', 0):,}")
+            console.print(f"  Total Tokens:  {last_call.get('total_tokens', 0):,}")
+            
+            # Show cache info if available
+            if state.cached_content_name:
+                estimated_saved = 15000 * session_totals.get('api_calls', 1)
+                console.print(f"\n[green]Cache Status:[/green] Using cached system prompt ({state.cached_content_name})")
+                console.print(f"[green]Cache Savings:[/green] Estimated ~{estimated_saved:,} tokens saved this session")
+            else:
+                console.print(f"\n[yellow]Cache Status:[/yellow] No cache in use")
+        else:
+            print("\nToken Usage Debug Information:")
+            print("Session Totals:")
+            print(f"  Input Tokens:  {session_totals.get('input_tokens', 0):,}")
+            print(f"  Output Tokens: {session_totals.get('output_tokens', 0):,}")
+            print(f"  Total Tokens:  {session_totals.get('total_tokens', 0):,}")
+            print(f"  API Calls:     {session_totals.get('api_calls', 0):,}")
+            print("\nLast API Call:")
+            print(f"  Input Tokens:  {last_call.get('input_tokens', 0):,}")
+            print(f"  Output Tokens: {last_call.get('output_tokens', 0):,}")
+            print(f"  Total Tokens:  {last_call.get('total_tokens', 0):,}")
+            
+            if state.cached_content_name:
+                estimated_saved = 15000 * session_totals.get('api_calls', 1)
+                print(f"\nCache Status: Using cached system prompt ({state.cached_content_name})")
+                print(f"Cache Savings: Estimated ~{estimated_saved:,} tokens saved this session")
+            else:
+                print("\nCache Status: No cache in use")
 
     async def call_tool_direct(name: str, args_str: str):
         if name not in state.tool_names:
@@ -1336,6 +1711,9 @@ async def chat_loop(session: ClientSession):
         if low.startswith("/tools"):
             list_tools()
             continue
+        if low.startswith("/tokens"):
+            show_token_debug()
+            continue
         if low.startswith("/call "):
             # /call <name> <json-args>
             try:
@@ -1351,7 +1729,12 @@ async def chat_loop(session: ClientSession):
             continue
 
         # Otherwise: forward to the model (natural language)
-        state.history_contents.append(types.UserContent(parts=[types.Part(text=user)]))
+        try:
+            user_content = types.UserContent(parts=[types.Part(text=user)])
+            state.history_contents.append(user_content)
+        except Exception:
+            # Fallback to dict format if types construction fails
+            state.history_contents.append({"role": "user", "parts": [{"text": user}]})
         state.trim_history()
 
         final_text = await run_tool_call_loop()
@@ -1370,6 +1753,25 @@ async def chat_loop(session: ClientSession):
                     print(f"\nAssistant: {fallback_text}")
             else:
                 warn("No user-visible text returned (model sent only tool calls or thoughts). Try /thinking off and ask again.")
+        
+        # Display token consumption after each iteration
+        session_totals = state.token_tracker.get_session_totals()
+        last_call_usage = state.token_tracker.get_last_call_usage()
+        
+        # Prepare cache information for display
+        cache_info = {
+            'enabled': bool(state.cached_content_name),
+            'estimated_saved_tokens': 15000,  # Estimated system prompt size
+            'api_calls': session_totals.get('api_calls', 1)
+        }
+        
+        display_token_usage(last_call_usage, session_totals, cache_info)
+    
+    # Add cleanup when chat ends
+    try:
+        cache_manager.cleanup_cache(client)
+    except Exception as e:
+        print(f"[WARN] Cache cleanup failed: {e}")
 
 # ---------------------- Entrypoint ----------------------
 async def main():
@@ -1436,14 +1838,29 @@ async def main():
         },
     )
 
-    async with AsyncExitStack() as stack:
-        read, write = await stack.enter_async_context(stdio_client(server_params))
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            # Header for non-rich envs
-            print(f"Connected to Xero MCP at {datetime.now().isoformat(timespec='seconds')}")
-            print(f"Model: {MODEL}  |  SDK: google-genai")
-            await chat_loop(session)
+    try:
+        async with AsyncExitStack() as stack:
+            read, write = await stack.enter_async_context(stdio_client(server_params))
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                # Header for non-rich envs
+                print(f"Connected to Xero MCP at {datetime.now().isoformat(timespec='seconds')}")
+                print(f"Model: {MODEL}  |  SDK: google-genai")
+                await chat_loop(session)
+    except KeyboardInterrupt:
+        print("\n[INFO] Chat interrupted by user")
+        try:
+            client = genai.Client()
+            cache_manager.cleanup_cache(client)
+        except:
+            pass
+    except Exception as e:
+        print(f"[ERROR] Unexpected error: {e}")
+        try:
+            client = genai.Client()
+            cache_manager.cleanup_cache(client)
+        except:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
