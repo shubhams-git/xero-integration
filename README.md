@@ -2,7 +2,35 @@
 
 A comprehensive system for integrating with Xero accounting software using Model Context Protocol (MCP) and Gemini AI for natural language interactions.
 
-## Architecture Overview
+## Data Flow Overview
+
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Client    │────▶│  OAuth Flow  │───▶│   NeonDB     │
+│  Browser    │     │ (server/app) │     │  (Postgres)  │
+└─────────────┘     └──────────────┘     └──────────────┘
+                            │                      │
+                            ▼                      ▼
+                    ┌──────────────┐     ┌──────────────┐
+                    │ Xero OAuth   │     │ Token Store  │
+                    │   Service    │     │   & Refresh  │
+                    └──────────────┘     └──────────────┘
+                                                   │
+                    ┌──────────────────────────────┘
+                    ▼                            
+            ┌──────────────┐              ┌──────────────┐
+            │ mcp_client.py│              │Xero MCP      │
+            │   (Chat UI)  │◀───────────▶│   Server     │
+            └──────────────┘              └──────────────┘
+                    │                              
+                    ▼                              
+            ┌──────────────┐
+            │  Gemini AI   │
+            │  (2.5 Flash) │              
+            └──────────────┘              
+```
+
+## Detailed Architecture Diagram
 
 ```mermaid
 graph TD
